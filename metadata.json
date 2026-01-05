@@ -1,0 +1,7 @@
+{
+  "name": "LiveScribe PL",
+  "description": "Aplikacja do transkrypcji rozmów na żywo z obsługą języka polskiego i archiwizacją długich sesji.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
