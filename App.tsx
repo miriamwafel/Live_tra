@@ -13,6 +13,9 @@ import {
   ArrowPathIcon
 } from '@heroicons/react/24/solid';
 
+// Keep-alive configuration
+const KEEPALIVE_INTERVAL_MS = 25000; // Send ping every 25 seconds to prevent timeout
+
 const App: React.FC = () => {
   // --- State ---
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
@@ -26,14 +29,19 @@ const App: React.FC = () => {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const sessionRef = useRef<any>(null);
-  
+
   // Logic Refs
   const currentInputTransRef = useRef<string>('');
   const scrollBottomRef = useRef<HTMLDivElement>(null);
-  
+
   // Auto-reconnect Logic
   const isRecordingActiveRef = useRef<boolean>(false);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keep-alive Logic
+  const keepAliveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastActivityRef = useRef<number>(Date.now());
+  const reconnectAttemptRef = useRef<number>(0);
 
   // --- Effects ---
 
@@ -85,6 +93,37 @@ const App: React.FC = () => {
     });
   };
 
+  // --- Keep-Alive Logic ---
+
+  const startKeepAlive = useCallback(() => {
+    stopKeepAlive(); // Clear any existing interval
+
+    keepAliveIntervalRef.current = setInterval(() => {
+      const timeSinceActivity = Date.now() - lastActivityRef.current;
+
+      // If no activity for most of the interval, send a silent audio ping
+      if (timeSinceActivity > KEEPALIVE_INTERVAL_MS - 5000 && sessionRef.current) {
+        console.log("Sending keep-alive ping...");
+        try {
+          // Send a small silent audio chunk to keep connection alive
+          const silentPcm = new Float32Array(160); // 10ms of silence at 16kHz
+          const silentBlob = createBlob(silentPcm);
+          sessionRef.current.sendRealtimeInput({ media: silentBlob });
+          lastActivityRef.current = Date.now();
+        } catch (e) {
+          console.warn("Keep-alive ping failed:", e);
+        }
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+  }, []);
+
+  const stopKeepAlive = useCallback(() => {
+    if (keepAliveIntervalRef.current) {
+      clearInterval(keepAliveIntervalRef.current);
+      keepAliveIntervalRef.current = null;
+    }
+  }, []);
+
   // --- Core Logic ---
 
   const startSession = async () => {
@@ -135,9 +174,10 @@ const App: React.FC = () => {
           onopen: () => {
             console.log("Session Opened");
             setStatus(ConnectionStatus.CONNECTED);
-            
+            reconnectAttemptRef.current = 0; // Reset reconnect attempts on successful connection
+
             if (!inputAudioContextRef.current || !stream) return;
-            
+
             if (inputAudioContextRef.current.state === 'suspended') {
               inputAudioContextRef.current.resume();
             }
@@ -150,10 +190,13 @@ const App: React.FC = () => {
 
             processor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              
+
               let sum = 0;
               for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
               setVolume(Math.sqrt(sum / inputData.length));
+
+              // Update activity timestamp
+              lastActivityRef.current = Date.now();
 
               const currentSampleRate = inputAudioContextRef.current?.sampleRate || 48000;
               const resampledData = resampleTo16k(inputData, currentSampleRate);
@@ -166,10 +209,16 @@ const App: React.FC = () => {
 
             source.connect(processor);
             processor.connect(inputAudioContextRef.current.destination);
+
+            // Start keep-alive mechanism to prevent timeout
+            startKeepAlive();
           },
           onmessage: async (msg: LiveServerMessage) => {
             const content = msg.serverContent;
-            
+
+            // Update activity timestamp on any message
+            lastActivityRef.current = Date.now();
+
             if (content?.inputTranscription) {
               const text = content.inputTranscription.text;
               if (text) {
@@ -189,16 +238,26 @@ const App: React.FC = () => {
             console.log("Session Closed", e);
             cleanupSession(false); // Clean up audio nodes but keep intent
 
-            // AUTO-RECONNECT LOGIC
+            // AUTO-RECONNECT LOGIC with exponential backoff
             // If user didn't press stop (isRecordingActiveRef is true), reconnect.
             if (isRecordingActiveRef.current) {
-                console.log("Auto-reconnecting due to API limit or network drop...");
-                setStatus(ConnectionStatus.CONNECTING); // Visual feedback
-                
-                // Small delay to ensure clean socket state
-                reconnectTimeoutRef.current = setTimeout(() => {
-                    startSession();
-                }, 500);
+                reconnectAttemptRef.current++;
+                const maxAttempts = 10;
+
+                if (reconnectAttemptRef.current <= maxAttempts) {
+                  // Exponential backoff: 500ms, 1s, 2s, 4s... max 30s
+                  const delay = Math.min(500 * Math.pow(2, reconnectAttemptRef.current - 1), 30000);
+                  console.log(`Auto-reconnecting (attempt ${reconnectAttemptRef.current}/${maxAttempts}) in ${delay}ms...`);
+                  setStatus(ConnectionStatus.CONNECTING);
+
+                  reconnectTimeoutRef.current = setTimeout(() => {
+                      startSession();
+                  }, delay);
+                } else {
+                  console.error("Max reconnect attempts reached. Stopping.");
+                  setErrorMsg("Nie udało się wznowić połączenia. Spróbuj ponownie ręcznie.");
+                  stopUserAction();
+                }
             } else {
                 setStatus(ConnectionStatus.DISCONNECTED);
             }
@@ -208,9 +267,13 @@ const App: React.FC = () => {
             // Don't kill the app, try to reconnect if it's a network blip
             if (isRecordingActiveRef.current) {
                  cleanupSession(false);
+                 reconnectAttemptRef.current++;
+                 const delay = Math.min(1000 * Math.pow(2, reconnectAttemptRef.current - 1), 30000);
+                 console.log(`Reconnecting after error (attempt ${reconnectAttemptRef.current}) in ${delay}ms...`);
+
                  reconnectTimeoutRef.current = setTimeout(() => {
                     startSession();
-                }, 1000);
+                }, delay);
             } else {
                 setErrorMsg("Błąd połączenia. Sesja zakończona.");
                 stopUserAction();
@@ -229,17 +292,20 @@ const App: React.FC = () => {
   };
 
   // Internal cleanup (stops nodes, leaves intent flag alone unless specified)
-  const cleanupSession = (fullStop = true) => {
+  const cleanupSession = useCallback((fullStop = true) => {
     if (currentInputTransRef.current) {
       updateTranscript(currentInputTransRef.current, true);
       currentInputTransRef.current = '';
     }
 
+    // Stop keep-alive mechanism
+    stopKeepAlive();
+
     if (sourceNodeRef.current) {
         try { sourceNodeRef.current.disconnect(); } catch (e) {}
         sourceNodeRef.current = null;
     }
-    
+
     if (processorRef.current) {
       try { processorRef.current.disconnect(); } catch (e) {}
       processorRef.current = null;
@@ -259,21 +325,22 @@ const App: React.FC = () => {
       try { sessionRef.current.close(); } catch (e) {}
       sessionRef.current = null;
     }
-    
+
     if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
     }
 
     setVolume(0);
-  };
+  }, [stopKeepAlive]);
 
   // User explicitly clicks Stop
-  const stopUserAction = () => {
+  const stopUserAction = useCallback(() => {
     isRecordingActiveRef.current = false;
+    reconnectAttemptRef.current = 0; // Reset reconnect attempts
     cleanupSession(true);
     setStatus(ConnectionStatus.DISCONNECTED);
-  };
+  }, [cleanupSession]);
 
   const handleDownload = () => {
     const text = transcript
