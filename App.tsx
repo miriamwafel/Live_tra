@@ -147,46 +147,12 @@ const App: React.FC = () => {
 
     const finalTranscript = diarizedTranscript.length > 0 ? diarizedTranscript : liveTranscript;
 
-    // Ask user what they want to save
-    const choice = window.prompt(
-      "Co chcesz zrobić?\n\n" +
-      "1 - Zapisz TYLKO do Bazy Wiedzy (bez sesji/nagrania)\n" +
-      "2 - Zapisz pełną sesję (z transkrypcją)\n" +
-      "3 - Anuluj\n\n" +
-      "Wpisz 1, 2 lub 3:"
-    );
-
-    if (choice === '1') {
-      // Only update knowledge base, don't save session
+    if (confirm("Czy chcesz zapisać szczegółowy opis rozmowy do Bazy Wiedzy?\n\n(Transkrypcja i nagranie zostaną usunięte)")) {
       generateArtifact(selectedClient, 'knowledge', finalTranscript);
       clearRecordingData();
-    } else if (choice === '2') {
-      // Save full session
-      const newSession: ClientSession = {
-        id: Date.now().toString(),
-        date: new Date().toISOString(),
-        transcript: finalTranscript,
-        summary: `Sesja z dnia ${new Date().toLocaleDateString()}`
-      };
-
-      const updatedClient = {
-        ...selectedClient,
-        sessions: [newSession, ...selectedClient.sessions]
-      };
-
-      saveClient(updatedClient);
-      setClients(getClients());
-      setSelectedClient(updatedClient);
-
-      if (confirm("Sesja zapisana! Czy chcesz też zaktualizować Bazę Wiedzy?")) {
-        generateArtifact(updatedClient, 'knowledge', finalTranscript);
-      } else {
-        setView('client-detail');
-      }
-      clearRecordingData();
     } else {
-      // Cancel - go back
       setView('client-detail');
+      clearRecordingData();
     }
   };
 
@@ -231,17 +197,34 @@ const App: React.FC = () => {
             3. Kluczowe korzyści.
             4. Wstępny plan działania.`;
         } else if (type === 'knowledge') {
-            prompt = `Jesteś analitykiem CRM.
-            Masz zaktualizować "Bazę Wiedzy" o kliencie na podstawie nowej rozmowy.
+            const wordCount = transcriptText.split(/\s+/).length;
+            prompt = `Jesteś ekspertem od dokumentowania spotkań biznesowych.
 
-            Aktualna baza wiedzy: ${client.knowledgeBase}
+            Klient: ${client.name} (${client.industry || 'Brak branży'})
 
-            Nowa rozmowa:
+            Aktualna baza wiedzy o kliencie: ${client.knowledgeBase || 'Brak wcześniejszych danych'}
+
+            === ROZMOWA DO PRZEANALIZOWANIA ===
             ${transcriptText}
+            === KONIEC ROZMOWY ===
 
-            Zadanie: Wypisz w punktach kluczowe fakty o kliencie (budżet, decydenci, kluczowe bolączki, cele, preferencje).
-            Nie pisz streszczenia rozmowy, tylko SUCHE FAKTY do bazy danych. Jeśli coś się zmieniło względem starej bazy, zaktualizuj to.
-            Zwróć TYLKO zaktualizowaną treść bazy wiedzy.`;
+            ZADANIE: Napisz EKSTREMALNIE SZCZEGÓŁOWY opis tej rozmowy.
+
+            WYMAGANIA:
+            - Opis musi mieć MINIMUM ${wordCount} słów (tyle ile transkrypcja lub więcej)
+            - Opisz KAŻDY poruszony temat bardzo dokładnie
+            - Uwzględnij WSZYSTKIE szczegóły, niuanse, kontekst
+            - Opisz ton rozmowy, nastrój, dynamikę
+            - Wynotuj WSZYSTKIE konkretne informacje (liczby, daty, nazwiska, firmy, produkty)
+            - Opisz co klient powiedział, jak zareagował, jakie miał obawy
+            - Uwzględnij wszelkie ustalenia, obietnice, kolejne kroki
+            - Jeśli była wcześniejsza baza wiedzy - zintegruj nowe informacje ze starymi
+            - NIE pomijaj żadnych detali - im więcej szczegółów tym lepiej
+            - Pisz w trzeciej osobie, profesjonalnie ale szczegółowo
+
+            FORMAT: Ciągły tekst opisowy (nie punkty). Możesz użyć akapitów dla czytelności.
+
+            Zwróć TYLKO szczegółowy opis do bazy wiedzy (bez komentarzy, bez nagłówków typu "Opis rozmowy:").`;
         }
 
         const response = await ai.models.generateContent({
