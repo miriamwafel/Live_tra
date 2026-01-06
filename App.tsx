@@ -45,6 +45,8 @@ const App: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedContent, setGeneratedContent] = useState<string | null>(null);
   const [generationType, setGenerationType] = useState<'email' | 'strategy' | 'knowledge'>('email');
+  const [descriptionPreview, setDescriptionPreview] = useState<string | null>(null);
+  const [pendingTranscript, setPendingTranscript] = useState<TranscriptEntry[] | null>(null);
 
   // --- Session/Recording State ---
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
@@ -138,7 +140,7 @@ const App: React.FC = () => {
     audioChunksRef.current = [];
   };
 
-  const saveSessionToClient = () => {
+  const saveSessionToClient = async () => {
     if (!selectedClient) return;
     if (liveTranscript.length === 0 && diarizedTranscript.length === 0) {
         setView('client-detail');
@@ -146,14 +148,75 @@ const App: React.FC = () => {
     }
 
     const finalTranscript = diarizedTranscript.length > 0 ? diarizedTranscript : liveTranscript;
+    setPendingTranscript(finalTranscript);
 
-    if (confirm("Czy chcesz zapisać szczegółowy opis rozmowy do Bazy Wiedzy?\n\n(Transkrypcja i nagranie zostaną usunięte)")) {
-      generateArtifact(selectedClient, 'knowledge', finalTranscript);
-      clearRecordingData();
-    } else {
-      setView('client-detail');
-      clearRecordingData();
+    // Generate preview
+    await generateDescriptionPreview(selectedClient, finalTranscript);
+  };
+
+  const generateDescriptionPreview = async (client: ClientProfile, transcript: TranscriptEntry[]) => {
+    setIsGenerating(true);
+    setDescriptionPreview(null);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const transcriptText = transcript.map(t => `[${t.timestamp}] ${t.text}`).join('\n');
+      const wordCount = transcriptText.split(/\s+/).length;
+
+      const prompt = `Jesteś protokolantem spotkania. Twoim zadaniem jest napisać szczegółową relację z rozmowy.
+
+Klient: ${client.name} (${client.industry || 'Brak branży'})
+
+${client.knowledgeBase ? `Wcześniejsze informacje o kliencie:\n${client.knowledgeBase}\n\n` : ''}=== ROZMOWA ===
+${transcriptText}
+=== KONIEC ===
+
+NAPISZ szczegółową relację z tej rozmowy:
+- Opisz CO kto powiedział, jakie padły słowa
+- Opisz przebieg rozmowy chronologicznie
+- Uwzględnij WSZYSTKIE szczegóły - tematy, liczby, nazwy, daty
+- Pisz prostym językiem, bez interpretacji i wniosków AI
+- NIE pisz rzeczy typu "wnioskując z...", "klient wydaje się...", "można założyć że..."
+- Pisz TYLKO fakty - co zostało powiedziane, bez domysłów
+- Minimum ${wordCount} słów
+
+Pisz w stylu: "Rozmowa dotyczyła... Klient powiedział że... Omówiono temat... Padła informacja że..."`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: prompt
+      });
+
+      setDescriptionPreview(response.text || '');
+    } catch (e) {
+      console.error(e);
+      alert("Błąd generowania opisu.");
+      setDescriptionPreview(null);
+    } finally {
+      setIsGenerating(false);
     }
+  };
+
+  const acceptDescription = () => {
+    if (!selectedClient || !descriptionPreview) return;
+
+    const updatedClient = { ...selectedClient, knowledgeBase: descriptionPreview };
+    saveClient(updatedClient);
+    setClients(getClients());
+    setSelectedClient(updatedClient);
+
+    // Clear everything
+    setDescriptionPreview(null);
+    setPendingTranscript(null);
+    clearRecordingData();
+    setView('client-detail');
+  };
+
+  const rejectDescription = () => {
+    setDescriptionPreview(null);
+    setPendingTranscript(null);
+    clearRecordingData();
+    setView('client-detail');
   };
 
   // --- AI Generator Logic ---
@@ -632,6 +695,44 @@ const App: React.FC = () => {
 
   // 4. RECORDING VIEW (Reusing logic but wrapped)
   if (view === 'recording' && selectedClient) {
+      // Show description preview modal
+      if (descriptionPreview || isGenerating) {
+        return (
+          <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans">
+            <header className="flex-none p-4 bg-slate-900 border-b border-slate-800">
+              <h1 className="text-lg font-bold">Podgląd opisu rozmowy</h1>
+              <span className="text-xs text-slate-400">Sprawdź i zaakceptuj lub odrzuć</span>
+            </header>
+            <main className="flex-1 overflow-y-auto p-6">
+              <div className="max-w-3xl mx-auto">
+                {isGenerating ? (
+                  <div className="flex flex-col items-center justify-center py-20">
+                    <ArrowPathIcon className="w-12 h-12 text-blue-500 animate-spin mb-4" />
+                    <p className="text-slate-400">Generowanie opisu...</p>
+                  </div>
+                ) : (
+                  <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-6">
+                    <p className="text-slate-200 whitespace-pre-wrap leading-relaxed">{descriptionPreview}</p>
+                  </div>
+                )}
+              </div>
+            </main>
+            {!isGenerating && descriptionPreview && (
+              <footer className="flex-none p-4 bg-slate-900 border-t border-slate-800">
+                <div className="max-w-3xl mx-auto flex justify-end gap-3">
+                  <button onClick={rejectDescription} className="px-6 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-medium">
+                    Odrzuć
+                  </button>
+                  <button onClick={acceptDescription} className="px-6 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg font-medium">
+                    Akceptuj i zapisz
+                  </button>
+                </div>
+              </footer>
+            )}
+          </div>
+        );
+      }
+
       return (
         <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans relative">
             <header className="flex-none p-4 bg-slate-900 border-b border-slate-800 z-10 flex justify-between">
