@@ -1,23 +1,31 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { createBlob, resampleTo16k, blobToBase64 } from './utils/audioUtils';
-import { TranscriptEntry, ConnectionStatus } from './types';
+import { TranscriptEntry, ConnectionStatus, ClientProfile, AppView, ClientSession } from './types';
+import { getClients, saveClient, deleteClient, createNewClient } from './utils/storage';
 import TranscriptItem from './components/TranscriptItem';
 import { 
   MicrophoneIcon, 
   StopIcon, 
   ArrowDownTrayIcon, 
   TrashIcon, 
-  DocumentTextIcon,
+  DocumentTextIcon, 
   ArrowPathIcon,
   UserGroupIcon,
   ClipboardDocumentIcon,
   ClipboardDocumentCheckIcon,
   LockClosedIcon,
-  KeyIcon
+  KeyIcon,
+  PlusIcon,
+  UserIcon,
+  BriefcaseIcon,
+  ChevronLeftIcon,
+  SparklesIcon,
+  EnvelopeIcon,
+  PresentationChartLineIcon
 } from '@heroicons/react/24/solid';
 
-const CORRECT_PASSWORD = '1234'; // HASŁO DO APLIKACJI
+const CORRECT_PASSWORD = '1234'; 
 
 const App: React.FC = () => {
   // --- Auth State ---
@@ -25,43 +33,49 @@ const App: React.FC = () => {
   const [passwordInput, setPasswordInput] = useState('');
   const [loginError, setLoginError] = useState(false);
 
-  // --- App State ---
+  // --- CRM State ---
+  const [view, setView] = useState<AppView>('dashboard');
+  const [clients, setClients] = useState<ClientProfile[]>([]);
+  const [selectedClient, setSelectedClient] = useState<ClientProfile | null>(null);
+  const [showNewClientModal, setShowNewClientModal] = useState(false);
+  const [newClientName, setNewClientName] = useState('');
+  const [newClientIndustry, setNewClientIndustry] = useState('');
+  
+  // --- Generator State ---
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generatedContent, setGeneratedContent] = useState<string | null>(null);
+  const [generationType, setGenerationType] = useState<'email' | 'strategy' | 'knowledge'>('email');
+
+  // --- Session/Recording State ---
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
   const [liveTranscript, setLiveTranscript] = useState<TranscriptEntry[]>([]);
   const [diarizedTranscript, setDiarizedTranscript] = useState<TranscriptEntry[]>([]);
   const [activeTab, setActiveTab] = useState<'live' | 'diarized'>('live');
-  
   const [volume, setVolume] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isCopied, setIsCopied] = useState(false);
-
-  // Recording & Diarization State
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [isProcessingDiarization, setIsProcessingDiarization] = useState(false);
 
-  // --- Refs for Audio & API ---
+  // --- Refs ---
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const sessionRef = useRef<any>(null);
-  
-  // Recorder Refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
-  
-  // Logic Refs
   const currentInputTransRef = useRef<string>('');
   const scrollBottomRef = useRef<HTMLDivElement>(null);
-  
-  // Auto-reconnect Logic
   const isRecordingActiveRef = useRef<boolean>(false);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // --- Helper: Get Active Transcript ---
   const currentTranscript = activeTab === 'live' ? liveTranscript : diarizedTranscript;
 
   // --- Effects ---
+  useEffect(() => {
+    setClients(getClients());
+  }, []);
 
   useEffect(() => {
     if (scrollBottomRef.current) {
@@ -77,20 +91,159 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // --- Auth Logic ---
-  const handleLogin = (e: React.FormEvent) => {
+  // --- CRM Logic ---
+
+  const handleCreateClient = (e: React.FormEvent) => {
     e.preventDefault();
-    if (passwordInput === CORRECT_PASSWORD) {
-      setIsLoggedIn(true);
-      setLoginError(false);
+    if (!newClientName.trim()) return;
+    const client = createNewClient(newClientName, newClientIndustry);
+    saveClient(client);
+    setClients(getClients());
+    setShowNewClientModal(false);
+    setNewClientName('');
+    setNewClientIndustry('');
+    // Open the new client immediately
+    setSelectedClient(client);
+    setView('client-detail');
+  };
+
+  const handleSelectClient = (client: ClientProfile) => {
+    setSelectedClient(client);
+    setView('client-detail');
+    setGeneratedContent(null);
+  };
+
+  const handleBackToDashboard = () => {
+    setView('dashboard');
+    setSelectedClient(null);
+    stopUserAction(); // Ensure recording stops if they force back
+  };
+
+  const startRecordingForClient = () => {
+    if (!selectedClient) return;
+    // Clear previous session data
+    setLiveTranscript([]);
+    setDiarizedTranscript([]);
+    setAudioBlob(null);
+    audioChunksRef.current = [];
+    setActiveTab('live');
+    setView('recording');
+    startSession(); // Auto-start
+  };
+
+  const saveSessionToClient = () => {
+    if (!selectedClient) return;
+    if (liveTranscript.length === 0 && diarizedTranscript.length === 0) {
+        setView('client-detail');
+        return;
+    }
+
+    const finalTranscript = diarizedTranscript.length > 0 ? diarizedTranscript : liveTranscript;
+    
+    // Create new session
+    const newSession: ClientSession = {
+        id: Date.now().toString(),
+        date: new Date().toISOString(),
+        transcript: finalTranscript,
+        summary: `Sesja z dnia ${new Date().toLocaleDateString()}`
+    };
+
+    const updatedClient = {
+        ...selectedClient,
+        sessions: [newSession, ...selectedClient.sessions]
+    };
+
+    saveClient(updatedClient);
+    setClients(getClients()); // Refresh list
+    setSelectedClient(updatedClient); // Update active view
+    
+    // Auto-update knowledge base attempt?
+    if (confirm("Sesja zapisana! Czy chcesz, aby AI zaktualizowało Bazę Wiedzy o kliencie na podstawie tej rozmowy?")) {
+        generateArtifact(updatedClient, 'knowledge', finalTranscript);
     } else {
-      setLoginError(true);
-      setPasswordInput('');
+        setView('client-detail');
     }
   };
 
-  // --- Helper Functions ---
+  // --- AI Generator Logic ---
 
+  const generateArtifact = async (client: ClientProfile, type: 'email' | 'strategy' | 'knowledge', sessionTranscript: TranscriptEntry[] | null = null) => {
+    setIsGenerating(true);
+    setGenerationType(type);
+    setGeneratedContent(null);
+
+    try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const model = ai.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+        // Prepare Context
+        const lastSession = sessionTranscript || (client.sessions.length > 0 ? client.sessions[0].transcript : []);
+        const transcriptText = lastSession.map(t => `${t.timestamp} [${t.speaker}]: ${t.text}`).join('\n');
+        
+        let prompt = "";
+        
+        if (type === 'email') {
+            prompt = `Jesteś asystentem biznesowym. 
+            Klient: ${client.name} (${client.industry || 'Brak branży'}).
+            Baza wiedzy o kliencie: ${client.knowledgeBase || 'Brak danych'}.
+            
+            Ostatnia rozmowa (transkrypcja):
+            ${transcriptText}
+            
+            Zadanie: Napisz profesjonalny e-mail podsumowujący (follow-up) do tego klienta.
+            Zaproponuj kolejne kroki wynikające z rozmowy. Styl: profesjonalny, ale relacyjny.`;
+        } else if (type === 'strategy') {
+            prompt = `Jesteś strategiem biznesowym.
+            Klient: ${client.name}.
+            Kontekst: ${client.knowledgeBase}.
+            
+            Ostatnia rozmowa:
+            ${transcriptText}
+            
+            Zadanie: Stwórz szkic strategii/oferty dla tego klienta.
+            Wypunktuj:
+            1. Zrozumiane potrzeby/problemy.
+            2. Proponowane rozwiązania (bazując na tym co było mówione).
+            3. Kluczowe korzyści.
+            4. Wstępny plan działania.`;
+        } else if (type === 'knowledge') {
+            prompt = `Jesteś analitykiem CRM.
+            Masz zaktualizować "Bazę Wiedzy" o kliencie na podstawie nowej rozmowy.
+            
+            Aktualna baza wiedzy: ${client.knowledgeBase}
+            
+            Nowa rozmowa:
+            ${transcriptText}
+            
+            Zadanie: Wypisz w punktach kluczowe fakty o kliencie (budżet, decydenci, kluczowe bolączki, cele, preferencje).
+            Nie pisz streszczenia rozmowy, tylko SUCHE FAKTY do bazy danych. Jeśli coś się zmieniło względem starej bazy, zaktualizuj to.
+            Zwróć TYLKO zaktualizowaną treść bazy wiedzy.`;
+        }
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+
+        if (type === 'knowledge') {
+            // Auto-save knowledge base
+            const updatedClient = { ...client, knowledgeBase: text };
+            saveClient(updatedClient);
+            setClients(getClients());
+            setSelectedClient(updatedClient);
+            alert("Baza wiedzy klienta została zaktualizowana!");
+            if (view === 'recording') setView('client-detail');
+        } else {
+            setGeneratedContent(text);
+        }
+
+    } catch (e) {
+        console.error(e);
+        alert("Błąd generowania AI.");
+    } finally {
+        setIsGenerating(false);
+    }
+  };
+
+  // --- Audio / Transcript Logic (Existing) ---
   const formatTime = () => {
     const now = new Date();
     return now.toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -99,7 +252,6 @@ const App: React.FC = () => {
   const updateLiveTranscript = (text: string, isFinal: boolean) => {
     setLiveTranscript(prev => {
       const speaker = 'user'; 
-      
       const newEntry: TranscriptEntry = {
         id: Date.now().toString() + Math.random(),
         timestamp: formatTime(),
@@ -107,7 +259,6 @@ const App: React.FC = () => {
         text,
         isPartial: !isFinal
       };
-
       if (prev.length > 0) {
         const last = prev[prev.length - 1];
         if (last.isPartial) {
@@ -118,170 +269,109 @@ const App: React.FC = () => {
           }
         }
       }
-      
       return [...prev, newEntry];
     });
   };
 
-  // --- Core Logic ---
-
   const startSession = async () => {
     if (status === ConnectionStatus.CONNECTING || status === ConnectionStatus.CONNECTED) return;
-
     try {
       setErrorMsg(null);
       setStatus(ConnectionStatus.CONNECTING);
       isRecordingActiveRef.current = true;
-      setActiveTab('live'); // Always switch to live when starting
+      setActiveTab('live');
       
-      // Reset audio blob if starting a FRESH session
       if (liveTranscript.length === 0) {
         setAudioBlob(null);
         audioChunksRef.current = [];
       }
 
-      // 1. Initialize Audio Context
-      if (inputAudioContextRef.current) {
-        await inputAudioContextRef.current.close();
-      }
+      if (inputAudioContextRef.current) await inputAudioContextRef.current.close();
       inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
 
-      // 2. Get Microphone Access
       let stream = mediaStreamRef.current;
       if (!stream || !stream.active) {
-         stream = await navigator.mediaDevices.getUserMedia({ audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          autoGainControl: true,
-          noiseSuppression: true
-        } });
-        mediaStreamRef.current = stream;
+         stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, autoGainControl: true, noiseSuppression: true } });
+         mediaStreamRef.current = stream;
       }
 
-      // --- Start Local Recording ---
       if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
-         const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
-             ? 'audio/webm;codecs=opus' 
-             : 'audio/mp4'; 
-         
+         const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/mp4'; 
          const recorder = new MediaRecorder(stream, { mimeType });
          mediaRecorderRef.current = recorder;
-         
          recorder.ondataavailable = (event) => {
-           if (event.data.size > 0) {
-             audioChunksRef.current.push(event.data);
-           }
+           if (event.data.size > 0) audioChunksRef.current.push(event.data);
          };
-
          recorder.start(1000); 
       }
 
-      // 3. Initialize Gemini Client
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
-      // 4. Connect to Live API
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-          },
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
           inputAudioTranscription: {}, 
-          systemInstruction: {
-            parts: [{ text: "Jesteś profesjonalnym transkrybentem języka polskiego. Twoim absolutnym priorytetem jest zapisywanie słyszanej mowy WYŁĄCZNIE w języku polskim. \n\nZASADY:\n1. Zapisuj tekst poprawną polszczyzną, dbając o interpunkcję.\n2. NIGDY nie używaj cyrylicy. Jeśli słowo brzmi obco, zapisz je fonetycznie alfabetem łacińskim.\n3. Jeśli mowa jest niewyraźna, staraj się dopasować najbardziej prawdopodobne słowa polskie.\n4. Nie prowadź konwersacji. Nie odpowiadaj na pytania. Działaj jak 'ukryty stenograf'." }]
-          },
+          systemInstruction: { parts: [{ text: "Jesteś stenografem. Zapisuj dokładnie po polsku." }] },
         },
         callbacks: {
           onopen: () => {
-            console.log("Session Opened");
             setStatus(ConnectionStatus.CONNECTED);
-            
             if (!inputAudioContextRef.current || !stream) return;
+            if (inputAudioContextRef.current.state === 'suspended') inputAudioContextRef.current.resume();
             
-            if (inputAudioContextRef.current.state === 'suspended') {
-              inputAudioContextRef.current.resume();
-            }
-
             const source = inputAudioContextRef.current.createMediaStreamSource(stream);
             sourceNodeRef.current = source;
-
             const processor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
             processorRef.current = processor;
-
+            
             processor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              
               let sum = 0;
               for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
               setVolume(Math.sqrt(sum / inputData.length));
-
-              const currentSampleRate = inputAudioContextRef.current?.sampleRate || 48000;
-              const resampledData = resampleTo16k(inputData, currentSampleRate);
-
-              const pcmBlob = createBlob(resampledData);
-              sessionPromise.then((session) => {
-                 session.sendRealtimeInput({ media: pcmBlob });
-              });
+              const resampledData = resampleTo16k(inputData, inputAudioContextRef.current?.sampleRate || 48000);
+              sessionPromise.then(s => s.sendRealtimeInput({ media: createBlob(resampledData) }));
             };
-
             source.connect(processor);
             processor.connect(inputAudioContextRef.current.destination);
           },
           onmessage: async (msg: LiveServerMessage) => {
             const content = msg.serverContent;
-            
-            if (content?.inputTranscription) {
-              const text = content.inputTranscription.text;
-              if (text) {
-                 currentInputTransRef.current += text;
+            if (content?.inputTranscription?.text) {
+                 currentInputTransRef.current += content.inputTranscription.text;
                  updateLiveTranscript(currentInputTransRef.current, false);
-              }
             }
-
-            if (content?.turnComplete) {
-               if (currentInputTransRef.current) {
+            if (content?.turnComplete && currentInputTransRef.current) {
                  updateLiveTranscript(currentInputTransRef.current, true);
                  currentInputTransRef.current = '';
-               }
             }
           },
-          onclose: (e) => {
-            console.log("Session Closed", e);
-            cleanupSession(false); 
-
+          onclose: () => {
+            cleanupSession(false);
             if (isRecordingActiveRef.current) {
-                console.log("Auto-reconnecting...");
                 setStatus(ConnectionStatus.CONNECTING);
-                
-                reconnectTimeoutRef.current = setTimeout(() => {
-                    startSession();
-                }, 500);
+                reconnectTimeoutRef.current = setTimeout(startSession, 500);
             } else {
                 setStatus(ConnectionStatus.DISCONNECTED);
                 finalizeRecording();
             }
           },
-          onerror: (e) => {
-            console.error("Session Error", e);
-            if (isRecordingActiveRef.current) {
+          onerror: () => {
+             if (isRecordingActiveRef.current) {
                  cleanupSession(false);
-                 reconnectTimeoutRef.current = setTimeout(() => {
-                    startSession();
-                }, 1000);
-            } else {
-                setErrorMsg("Błąd połączenia. Sesja zakończona.");
+                 reconnectTimeoutRef.current = setTimeout(startSession, 1000);
+             } else {
+                setErrorMsg("Błąd połączenia.");
                 stopUserAction();
-            }
+             }
           }
         }
       });
-
       sessionRef.current = await sessionPromise;
-
     } catch (err) {
       console.error(err);
-      setErrorMsg("Nie udało się połączyć. Sprawdź internet i mikrofon.");
+      setErrorMsg("Błąd mikrofonu/sieci.");
       stopUserAction();
     }
   };
@@ -291,58 +381,28 @@ const App: React.FC = () => {
       updateLiveTranscript(currentInputTransRef.current, true);
       currentInputTransRef.current = '';
     }
-
-    if (sourceNodeRef.current) {
-        try { sourceNodeRef.current.disconnect(); } catch (e) {}
-        sourceNodeRef.current = null;
-    }
-    
-    if (processorRef.current) {
-      try { processorRef.current.disconnect(); } catch (e) {}
-      processorRef.current = null;
-    }
-
+    try { sourceNodeRef.current?.disconnect(); } catch {}
+    try { processorRef.current?.disconnect(); } catch {}
     if (fullStop) {
-        if (mediaStreamRef.current) {
-          mediaStreamRef.current.getTracks().forEach(track => track.stop());
-          mediaStreamRef.current = null;
-        }
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-            mediaRecorderRef.current.stop();
-        }
+        if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
     }
-
-    if (inputAudioContextRef.current) {
-        try { inputAudioContextRef.current.close(); } catch (e) {}
-        inputAudioContextRef.current = null;
-    }
-
-    if (sessionRef.current) {
-      try { sessionRef.current.close(); } catch (e) {}
-      sessionRef.current = null;
-    }
-    
-    if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-    }
-
+    try { inputAudioContextRef.current?.close(); } catch {}
+    try { sessionRef.current?.close(); } catch {}
+    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
     setVolume(0);
   };
 
   const finalizeRecording = () => {
     if (audioChunksRef.current.length > 0) {
         const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
-        const blob = new Blob(audioChunksRef.current, { type: mimeType });
-        setAudioBlob(blob);
+        setAudioBlob(new Blob(audioChunksRef.current, { type: mimeType }));
     }
   };
 
   const stopUserAction = () => {
     isRecordingActiveRef.current = false;
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
     cleanupSession(true);
     setStatus(ConnectionStatus.DISCONNECTED);
     finalizeRecording();
@@ -350,117 +410,47 @@ const App: React.FC = () => {
 
   const handleDiarization = async () => {
     if (!audioBlob) return;
-    
     setIsProcessingDiarization(true);
     try {
         const base64Audio = await blobToBase64(audioBlob);
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        
         const modelId = 'gemini-2.0-flash';
-        const mimeType = audioBlob.type.split(';')[0] || 'audio/webm';
-
         const response = await ai.models.generateContent({
             model: modelId,
             contents: {
                 parts: [
-                    {
-                        inlineData: {
-                            mimeType: mimeType,
-                            data: base64Audio
-                        }
-                    },
-                    {
-                        text: `Przeanalizuj to nagranie audio i stwórz dokładną transkrypcję w języku polskim. 
-                        
-                        Twoim kluczowym zadaniem jest ROZPOZNANIE MÓWCÓW (Diarizacja).
-                        
-                        Formatuj wyjście następująco:
-                        [00:00] Mówca 1: Tekst...
-                        [00:15] Mówca 2: Tekst...
-                        
-                        Jeśli rozpoznasz imiona z kontekstu, użyj ich zamiast "Mówca 1". 
-                        Zadbaj o interpunkcję i poprawność gramatyczną.
-                        NIGDY nie używaj cyrylicy, używaj tylko języka polskiego (alfabet łaciński).`
-                    }
+                    { inlineData: { mimeType: audioBlob.type.split(';')[0] || 'audio/webm', data: base64Audio } },
+                    { text: `Diarizacja (rozpoznanie mówców) i transkrypcja pliku audio. Język polski. Format: [MM:SS] Mówca: Tekst.` }
                 ]
             }
         });
-        
         const text = response.text;
         if (text) {
-            const lines = text.split('\n');
-            const newEntries: TranscriptEntry[] = lines
-                .filter(line => line.trim().length > 0)
-                .map((line, idx) => ({
-                    id: `diarized-${idx}`,
-                    timestamp: line.match(/\[(.*?)\]/)?.[1] || "00:00",
-                    speaker: line.toLowerCase().includes('mówca 2') || line.toLowerCase().includes('speaker 2') ? 'model' : 'user', 
-                    text: line.replace(/\[.*?\]/, '').trim(),
+            const newEntries: TranscriptEntry[] = text.split('\n')
+                .filter(l => l.trim().length > 0)
+                .map((l, i) => ({
+                    id: `d-${i}`,
+                    timestamp: l.match(/\[(.*?)\]/)?.[1] || "00:00",
+                    speaker: l.toLowerCase().includes('mówca 2') ? 'model' : 'user',
+                    text: l.replace(/\[.*?\]/, '').trim(),
                     isPartial: false
                 }));
-            
-            // SET SEPARATE DIARIZED TRANSCRIPT
             setDiarizedTranscript(newEntries);
-            setActiveTab('diarized'); // Switch to the new tab
-            alert("Analiza zakończona. Wynik znajduje się w zakładce 'Analiza Nagrania'.");
+            setActiveTab('diarized');
         }
-
-    } catch (e) {
-        console.error("Diarization error", e);
-        setErrorMsg("Błąd podczas analizy nagrania. Sprawdź konsolę (F12) jeśli błąd się powtarza.");
-    } finally {
-        setIsProcessingDiarization(false);
-    }
+    } catch (e) { console.error(e); setErrorMsg("Błąd analizy."); } finally { setIsProcessingDiarization(false); }
   };
 
-  const handleDownload = () => {
-    // Download ONLY the active transcript
-    const source = currentTranscript;
-    const prefix = activeTab === 'live' ? 'Live' : 'Analiza';
-
-    const text = source
-      .map(t => `[${t.timestamp}] ${t.text}`)
-      .join('\n');
-    
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `transkrypcja_${prefix}_${new Date().toISOString().slice(0,10)}.txt`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
-  const handleCopy = () => {
-    // Copy ONLY the active transcript
-    const source = currentTranscript;
-    const text = source
-      .map(t => `[${t.timestamp}] ${t.text}`)
-      .join('\n');
-    
+  const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text).then(() => {
         setIsCopied(true);
         setTimeout(() => setIsCopied(false), 2000);
     });
   };
 
-  const clearCurrentTranscript = () => {
-    const tabName = activeTab === 'live' ? 'transkrypcję na żywo' : 'analizę nagrania';
-    if (confirm(`Czy na pewno chcesz usunąć ${tabName}?`)) {
-        if (activeTab === 'live') {
-            setLiveTranscript([]);
-            setAudioBlob(null); // Clear audio too if clearing live source
-            audioChunksRef.current = [];
-        } else {
-            setDiarizedTranscript([]);
-            // Don't clear audioBlob here, user might want to run analysis again
-            setActiveTab('live'); // Go back to live
-        }
-    }
-  };
+  // --- RENDERING ---
 
-  // --- LOGIN SCREEN ---
+  // 1. LOGIN
   if (!isLoggedIn) {
     return (
       <div className="flex flex-col h-screen bg-slate-900 text-slate-100 items-center justify-center font-sans">
@@ -470,211 +460,226 @@ const App: React.FC = () => {
                <LockClosedIcon className="w-8 h-8 text-blue-500" />
             </div>
           </div>
-          <h2 className="text-2xl font-bold text-center mb-6 tracking-tight">Dostęp do LiveScribe</h2>
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div className="relative">
-              <KeyIcon className="w-5 h-5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-              <input 
-                type="password"
-                value={passwordInput}
-                onChange={(e) => setPasswordInput(e.target.value)}
-                placeholder="Podaj hasło (1234)"
-                className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg py-3 pl-10 pr-4 focus:ring-2 focus:ring-blue-500 focus:outline-none transition-all"
-                autoFocus
-              />
-            </div>
-            {loginError && <p className="text-red-500 text-sm text-center font-medium animate-pulse">Nieprawidłowe hasło</p>}
-            <button 
-              type="submit"
-              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-3 rounded-lg shadow-lg shadow-blue-500/20 transition-all active:scale-95"
-            >
-              Zaloguj
-            </button>
+          <h2 className="text-2xl font-bold text-center mb-6 tracking-tight">Dostęp do CRM</h2>
+          <form onSubmit={(e) => { e.preventDefault(); if(passwordInput===CORRECT_PASSWORD) setIsLoggedIn(true); else setLoginError(true); }} className="space-y-4">
+            <input type="password" value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)} placeholder="Hasło (1234)" className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-3" autoFocus />
+            {loginError && <p className="text-red-500 text-sm text-center">Błąd</p>}
+            <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 text-white p-3 rounded-lg">Wejdź</button>
           </form>
-          <p className="text-center text-slate-600 text-xs mt-6">Wersja prywatna</p>
         </div>
       </div>
     );
   }
 
-  // --- MAIN APP ---
-  return (
-    <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans">
-      {/* Header */}
-      <header className="flex-none p-4 bg-slate-900 border-b border-slate-800 z-10">
-        <div className="max-w-5xl mx-auto flex justify-between items-center">
-          <div className="flex items-center gap-3">
-             <DocumentTextIcon className="w-6 h-6 text-blue-500" />
-             <div className="flex flex-col">
-                <h1 className="text-xl font-bold tracking-tight text-white leading-none">LiveScribe <span className="text-slate-500 font-normal">Transkrypcja</span></h1>
-                <span className="text-[10px] text-slate-600 font-mono mt-0.5">Model: Gemini 2.5 Flash (PL)</span>
-             </div>
-          </div>
-          
-          <div className="flex items-center gap-2">
-            {status === ConnectionStatus.CONNECTED && (
-              <div className="hidden md:flex items-center gap-2 mr-4 px-3 py-1 bg-red-500/10 rounded-full border border-red-500/20 transition-all">
-                <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
-                <span className="text-xs font-mono text-red-400 font-semibold tracking-wider">NAGRYWANIE</span>
-              </div>
-            )}
-            
-            <button 
-              onClick={handleCopy}
-              disabled={currentTranscript.length === 0}
-              className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors disabled:opacity-30 group relative"
-              title="Kopiuj do schowka"
-            >
-              {isCopied ? (
-                <ClipboardDocumentCheckIcon className="w-5 h-5 text-green-500" />
-              ) : (
-                <ClipboardDocumentIcon className="w-5 h-5" />
-              )}
-            </button>
-
-            <button 
-              onClick={handleDownload}
-              disabled={currentTranscript.length === 0}
-              className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors disabled:opacity-30"
-              title="Pobierz plik tekstowy"
-            >
-              <ArrowDownTrayIcon className="w-5 h-5" />
-            </button>
-            <button 
-              onClick={clearCurrentTranscript}
-              disabled={currentTranscript.length === 0}
-              className="p-2 hover:bg-red-900/20 rounded-lg text-slate-400 hover:text-red-400 transition-colors disabled:opacity-30"
-              title="Wyczyść"
-            >
-              <TrashIcon className="w-5 h-5" />
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* Tabs */}
-      {diarizedTranscript.length > 0 && (
-         <div className="flex-none bg-slate-900 border-b border-slate-800">
-             <div className="max-w-4xl mx-auto flex gap-4 px-4">
-                 <button 
-                    onClick={() => setActiveTab('live')}
-                    className={`pb-3 pt-3 px-2 text-sm font-medium border-b-2 transition-colors ${activeTab === 'live' ? 'border-blue-500 text-white' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
-                 >
-                    Na Żywo
-                 </button>
-                 <button 
-                    onClick={() => setActiveTab('diarized')}
-                    className={`pb-3 pt-3 px-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'diarized' ? 'border-indigo-500 text-white' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
-                 >
-                    <UserGroupIcon className="w-4 h-4" />
-                    Analiza Nagrania
-                 </button>
-             </div>
-         </div>
-      )}
-
-      {/* Main Transcript Area */}
-      <main className="flex-1 overflow-y-auto bg-slate-900 p-4 md:p-8 scrollbar-hide relative">
-        <div className="max-w-4xl mx-auto pb-32">
-          {currentTranscript.length === 0 ? (
-             activeTab === 'live' ? (
-                <div className="flex flex-col items-center justify-center h-64 mt-10 text-slate-600">
-                  <div className="p-4 bg-slate-800/50 rounded-full mb-4">
-                     <MicrophoneIcon className="w-12 h-12 opacity-50" />
-                  </div>
-                  <p className="text-lg font-medium text-slate-400">Gotowy do nagrywania</p>
-                  <p className="text-sm mt-2 max-w-md text-center">Naciśnij start. Aplikacja nagra dźwięk lokalnie i będzie tworzyć transkrypcję na żywo.</p>
+  // 2. DASHBOARD VIEW
+  if (view === 'dashboard') {
+    return (
+        <div className="min-h-screen bg-slate-900 text-slate-100 p-6 font-sans">
+            <header className="max-w-6xl mx-auto flex justify-between items-center mb-10">
+                <div className="flex items-center gap-3">
+                    <DocumentTextIcon className="w-8 h-8 text-blue-500" />
+                    <h1 className="text-2xl font-bold">LiveScribe CRM</h1>
                 </div>
-             ) : (
-                <div className="flex flex-col items-center justify-center h-64 mt-10 text-slate-600">
-                    <p>Brak danych analizy.</p>
-                </div>
-             )
-          ) : (
-            <div className="space-y-1">
-              {currentTranscript.map((entry) => (
-                <TranscriptItem key={entry.id} entry={entry} />
-              ))}
-            </div>
-          )}
-          <div ref={scrollBottomRef} />
-        </div>
-      </main>
+                <button onClick={() => setShowNewClientModal(true)} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg flex items-center gap-2">
+                    <PlusIcon className="w-5 h-5" /> Nowy Klient
+                </button>
+            </header>
 
-      {/* Audio Processing Toolbar (Post-recording) */}
-      {status === ConnectionStatus.DISCONNECTED && audioBlob && (
-        <div className="absolute bottom-32 left-0 right-0 z-30 flex justify-center animate-fade-in-up">
-           <div className="bg-slate-800/90 backdrop-blur border border-slate-700 p-4 rounded-xl shadow-2xl flex items-center gap-4 max-w-2xl mx-4">
-              <div className="flex flex-col">
-                  <span className="text-xs text-slate-400 font-mono uppercase mb-1">Ostatnie nagranie</span>
-                  <audio controls src={URL.createObjectURL(audioBlob)} className="h-8 w-64" />
-              </div>
-              <div className="h-10 w-px bg-slate-700 mx-2"></div>
-              <button 
-                onClick={handleDiarization}
-                disabled={isProcessingDiarization}
-                className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 text-white px-4 py-2 rounded-lg font-medium transition-colors shadow-lg shadow-indigo-500/20"
-              >
-                {isProcessingDiarization ? (
-                   <>
-                     <ArrowPathIcon className="w-5 h-5 animate-spin" />
-                     Analizowanie...
-                   </>
-                ) : (
-                   <>
-                     <UserGroupIcon className="w-5 h-5" />
-                     Transkrybuj z podziałem na osoby
-                   </>
+            <div className="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {clients.map(client => (
+                    <div key={client.id} onClick={() => handleSelectClient(client)} className="bg-slate-800 border border-slate-700 p-6 rounded-xl hover:bg-slate-750 cursor-pointer transition-all hover:border-blue-500/50 group">
+                        <div className="flex justify-between items-start mb-4">
+                            <div className="p-3 bg-slate-700 rounded-lg group-hover:bg-blue-600/20 group-hover:text-blue-400 transition-colors">
+                                <UserIcon className="w-6 h-6" />
+                            </div>
+                            <span className="text-xs text-slate-500 font-mono">{new Date(client.createdAt).toLocaleDateString()}</span>
+                        </div>
+                        <h3 className="text-xl font-bold text-white mb-1">{client.name}</h3>
+                        <p className="text-slate-400 text-sm mb-4">{client.industry || 'Brak branży'}</p>
+                        <div className="flex items-center gap-4 text-xs text-slate-500">
+                             <span className="flex items-center gap-1"><BriefcaseIcon className="w-3 h-3" /> {client.sessions.length} sesji</span>
+                        </div>
+                    </div>
+                ))}
+                {clients.length === 0 && (
+                    <div className="col-span-full text-center py-20 text-slate-500">
+                        <UserGroupIcon className="w-16 h-16 mx-auto mb-4 opacity-20" />
+                        <p>Brak klientów. Dodaj pierwszego, aby zacząć.</p>
+                    </div>
                 )}
-              </button>
-           </div>
-        </div>
-      )}
+            </div>
 
-      {/* Error Toast */}
-      {errorMsg && (
-        <div className="absolute top-20 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-6 py-3 rounded-lg shadow-xl z-50 text-sm font-medium animate-bounce">
-          {errorMsg}
+            {showNewClientModal && (
+                <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+                    <div className="bg-slate-800 p-8 rounded-xl w-full max-w-md border border-slate-700">
+                        <h3 className="text-xl font-bold mb-6">Dodaj nowego klienta</h3>
+                        <form onSubmit={handleCreateClient} className="space-y-4">
+                            <div>
+                                <label className="block text-sm text-slate-400 mb-1">Nazwa firmy / Imię i Nazwisko</label>
+                                <input value={newClientName} onChange={e => setNewClientName(e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded p-2" autoFocus />
+                            </div>
+                            <div>
+                                <label className="block text-sm text-slate-400 mb-1">Branża (opcjonalnie)</label>
+                                <input value={newClientIndustry} onChange={e => setNewClientIndustry(e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded p-2" />
+                            </div>
+                            <div className="flex justify-end gap-3 mt-6">
+                                <button type="button" onClick={() => setShowNewClientModal(false)} className="px-4 py-2 text-slate-300 hover:text-white">Anuluj</button>
+                                <button type="submit" className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-white">Utwórz</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
         </div>
-      )}
+    );
+  }
 
-      {/* Footer Controls */}
-      <footer className="flex-none bg-slate-900/90 backdrop-blur-sm border-t border-slate-800 p-6 fixed bottom-0 w-full z-20">
-        <div className="max-w-md mx-auto flex items-center justify-center gap-8 relative">
-           
-           {/* Visualizer Background Effect */}
-           {status === ConnectionStatus.CONNECTED && (
-             <div 
-               className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-32 h-32 bg-blue-500/10 rounded-full blur-2xl pointer-events-none transition-all duration-75"
-               style={{ transform: `translate(-50%, -50%) scale(${0.8 + volume * 4})`, opacity: 0.5 + volume }}
-             />
-           )}
+  // 3. CLIENT DETAIL VIEW
+  if (view === 'client-detail' && selectedClient) {
+      return (
+        <div className="flex h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans">
+             {/* Sidebar Navigation */}
+             <div className="w-64 bg-slate-800 border-r border-slate-700 flex flex-col">
+                 <div className="p-4 border-b border-slate-700">
+                     <button onClick={handleBackToDashboard} className="flex items-center gap-2 text-slate-400 hover:text-white text-sm mb-4">
+                         <ChevronLeftIcon className="w-4 h-4" /> Wróć
+                     </button>
+                     <h2 className="text-lg font-bold truncate">{selectedClient.name}</h2>
+                     <p className="text-xs text-slate-500">{selectedClient.industry}</p>
+                 </div>
+                 
+                 <div className="p-4 flex-1 overflow-y-auto">
+                     <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Sesje</h3>
+                     <div className="space-y-2">
+                         {selectedClient.sessions.map(s => (
+                             <div key={s.id} className="p-2 bg-slate-900/50 rounded hover:bg-slate-700 cursor-pointer text-sm">
+                                 <div className="font-medium text-slate-300">{new Date(s.date).toLocaleDateString()}</div>
+                                 <div className="text-xs text-slate-500 truncate">{s.summary}</div>
+                             </div>
+                         ))}
+                         {selectedClient.sessions.length === 0 && <p className="text-xs text-slate-600">Brak historii.</p>}
+                     </div>
+                 </div>
 
-           {status === ConnectionStatus.DISCONNECTED || status === ConnectionStatus.ERROR ? (
-             <button
-               onClick={startSession}
-               className="group relative flex items-center justify-center w-20 h-20 bg-blue-600 hover:bg-blue-500 text-white rounded-full shadow-lg hover:shadow-blue-500/20 transition-all transform hover:scale-105 active:scale-95"
-             >
-               <MicrophoneIcon className="w-9 h-9" />
-             </button>
-           ) : (
-             <button
-               onClick={stopUserAction}
-               className="group relative flex items-center justify-center w-20 h-20 bg-slate-700 hover:bg-red-600 text-white rounded-full shadow-lg transition-all transform hover:scale-105 active:scale-95"
-             >
-               <StopIcon className="w-9 h-9" />
-             </button>
-           )}
-           
-           {status === ConnectionStatus.CONNECTING && (
-              <span className="absolute -top-8 text-xs font-mono text-yellow-400 animate-pulse uppercase tracking-widest">
-                {liveTranscript.length > 0 ? "Odnawianie sesji..." : "Inicjalizacja..."}
-              </span>
-           )}
+                 <div className="p-4 border-t border-slate-700">
+                     <button onClick={startRecordingForClient} className="w-full bg-red-600 hover:bg-red-500 text-white py-3 rounded-lg flex items-center justify-center gap-2 shadow-lg shadow-red-900/20">
+                         <MicrophoneIcon className="w-5 h-5" /> Nowa Sesja
+                     </button>
+                 </div>
+             </div>
+
+             {/* Main Content */}
+             <div className="flex-1 flex flex-col overflow-hidden bg-slate-900">
+                 <div className="flex-1 overflow-y-auto p-8">
+                     {/* Generator Section */}
+                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                        {/* Left: Knowledge Base */}
+                        <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-6">
+                            <div className="flex justify-between items-center mb-4">
+                                <h3 className="font-bold flex items-center gap-2"><SparklesIcon className="w-5 h-5 text-yellow-500" /> Baza Wiedzy (AI)</h3>
+                                <button onClick={() => generateArtifact(selectedClient, 'knowledge')} className="text-xs text-blue-400 hover:text-blue-300">Aktualizuj</button>
+                            </div>
+                            <div className="text-sm text-slate-300 whitespace-pre-wrap min-h-[100px]">
+                                {selectedClient.knowledgeBase || "Brak danych kontekstowych. Przeprowadź rozmowę, aby AI mogło zbudować profil."}
+                            </div>
+                        </div>
+
+                        {/* Right: Generators */}
+                        <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-6">
+                             <h3 className="font-bold mb-4">Generator Treści</h3>
+                             <div className="flex gap-2 mb-4">
+                                 <button onClick={() => generateArtifact(selectedClient, 'email')} disabled={isGenerating} className="flex-1 bg-slate-700 hover:bg-slate-600 py-2 rounded text-sm flex items-center justify-center gap-2">
+                                     <EnvelopeIcon className="w-4 h-4" /> E-mail Follow-up
+                                 </button>
+                                 <button onClick={() => generateArtifact(selectedClient, 'strategy')} disabled={isGenerating} className="flex-1 bg-slate-700 hover:bg-slate-600 py-2 rounded text-sm flex items-center justify-center gap-2">
+                                     <PresentationChartLineIcon className="w-4 h-4" /> Strategia
+                                 </button>
+                             </div>
+                             
+                             {isGenerating ? (
+                                 <div className="h-40 flex items-center justify-center text-slate-500 animate-pulse">
+                                     <SparklesIcon className="w-6 h-6 mr-2" /> Generowanie...
+                                 </div>
+                             ) : generatedContent ? (
+                                 <div className="relative">
+                                     <textarea readOnly value={generatedContent} className="w-full h-64 bg-slate-900 p-3 rounded text-sm text-slate-300 border border-slate-700 focus:outline-none" />
+                                     <button onClick={() => handleCopy(generatedContent)} className="absolute top-2 right-2 p-1 bg-slate-800 rounded hover:text-white text-slate-400">
+                                         {isCopied ? <ClipboardDocumentCheckIcon className="w-4 h-4 text-green-500" /> : <ClipboardDocumentIcon className="w-4 h-4" />}
+                                     </button>
+                                 </div>
+                             ) : (
+                                 <div className="h-40 flex items-center justify-center text-slate-600 text-sm border-2 border-dashed border-slate-700 rounded">
+                                     Wybierz szablon powyżej, aby wygenerować treść.
+                                 </div>
+                             )}
+                        </div>
+                     </div>
+                 </div>
+             </div>
         </div>
-      </footer>
-    </div>
-  );
+      );
+  }
+
+  // 4. RECORDING VIEW (Reusing logic but wrapped)
+  if (view === 'recording' && selectedClient) {
+      return (
+        <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans relative">
+            <header className="flex-none p-4 bg-slate-900 border-b border-slate-800 z-10 flex justify-between">
+                <div>
+                    <h1 className="text-lg font-bold">Sesja z: {selectedClient.name}</h1>
+                    <span className="text-xs text-red-400 animate-pulse font-mono">NAGRYWANIE AKTYWNE</span>
+                </div>
+                <div className="flex gap-2">
+                    <button onClick={() => handleCopy(currentTranscript.map(t => t.text).join('\n'))} className="p-2 hover:bg-slate-800 rounded text-slate-400"><ClipboardDocumentIcon className="w-5 h-5"/></button>
+                    <button onClick={saveSessionToClient} className="bg-green-600 hover:bg-green-500 text-white px-4 py-1 rounded text-sm font-bold shadow-lg shadow-green-900/20">
+                        Zakończ i Zapisz
+                    </button>
+                </div>
+            </header>
+
+             {/* Transcript Area */}
+             <main className="flex-1 overflow-y-auto p-4 md:p-8 relative">
+                 <div className="max-w-4xl mx-auto pb-32">
+                     {currentTranscript.length === 0 ? (
+                         <div className="text-center mt-20 text-slate-600">Rozpocznij mówić...</div>
+                     ) : (
+                         currentTranscript.map(entry => <TranscriptItem key={entry.id} entry={entry} />)
+                     )}
+                     <div ref={scrollBottomRef} />
+                 </div>
+             </main>
+
+             {/* Diarization Controls */}
+             {status === ConnectionStatus.DISCONNECTED && audioBlob && (
+                <div className="absolute bottom-32 left-0 right-0 z-30 flex justify-center">
+                   <div className="bg-slate-800/90 backdrop-blur border border-slate-700 p-4 rounded-xl shadow-2xl flex items-center gap-4">
+                      <audio controls src={URL.createObjectURL(audioBlob)} className="h-8 w-48" />
+                      <button onClick={handleDiarization} disabled={isProcessingDiarization} className="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1 rounded text-sm flex items-center gap-2">
+                        {isProcessingDiarization ? <ArrowPathIcon className="w-4 h-4 animate-spin"/> : <UserGroupIcon className="w-4 h-4"/>} 
+                        Analiza AI
+                      </button>
+                   </div>
+                </div>
+             )}
+
+             {/* Footer Controls */}
+             <footer className="flex-none bg-slate-900/90 border-t border-slate-800 p-6 fixed bottom-0 w-full z-20">
+                <div className="max-w-md mx-auto flex items-center justify-center gap-8 relative">
+                   {status === ConnectionStatus.CONNECTED && (
+                     <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-32 h-32 bg-blue-500/10 rounded-full blur-2xl pointer-events-none transition-all duration-75" style={{ transform: `translate(-50%, -50%) scale(${0.8 + volume * 4})`, opacity: 0.5 + volume }} />
+                   )}
+                   {status === ConnectionStatus.DISCONNECTED ? (
+                     <button onClick={startSession} className="w-16 h-16 bg-blue-600 rounded-full flex items-center justify-center shadow-lg"><MicrophoneIcon className="w-8 h-8 text-white"/></button>
+                   ) : (
+                     <button onClick={stopUserAction} className="w-16 h-16 bg-slate-700 hover:bg-red-600 rounded-full flex items-center justify-center shadow-lg transition-colors"><StopIcon className="w-8 h-8 text-white"/></button>
+                   )}
+                </div>
+             </footer>
+        </div>
+      );
+  }
+
+  return null;
 };
 
 export default App;
