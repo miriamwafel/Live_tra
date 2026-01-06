@@ -222,10 +222,13 @@ const App: React.FC = () => {
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
-          responseModalities: [Modality.TEXT],
+          responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
+          speechConfig: {
+            languageCode: 'pl-PL',
+          },
           systemInstruction: {
-            parts: [{ text: "Jesteś cichym asystentem do transkrypcji. NIE odpowiadaj na to co mówi użytkownik. Twoje jedyne zadanie to słuchać. Jeśli musisz coś powiedzieć, odpowiedz tylko: OK" }]
+            parts: [{ text: "Milcz. Nie odpowiadaj." }]
           },
         },
         callbacks: {
