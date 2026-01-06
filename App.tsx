@@ -165,10 +165,7 @@ const App: React.FC = () => {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           },
-          inputAudioTranscription: { languageCode: 'pl-PL' },
-          systemInstruction: {
-            parts: [{ text: "Transkrybuj tylko po polsku. Nie odpowiadaj." }]
-          },
+          inputAudioTranscription: {},
         },
         callbacks: {
           onopen: () => {
