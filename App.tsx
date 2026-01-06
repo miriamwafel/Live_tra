@@ -52,6 +52,7 @@ const App: React.FC = () => {
   const keepAliveIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   const isReconnectingRef = useRef<boolean>(false);
+  const isSessionActiveRef = useRef<boolean>(false);
 
   const scrollBottomRef = useRef<HTMLDivElement>(null);
 
@@ -124,9 +125,12 @@ const App: React.FC = () => {
   const startKeepAlive = () => {
     clearKeepAliveInterval();
     keepAliveIntervalRef.current = setInterval(() => {
+      // Only send keep-alive if session is active
+      if (!isSessionActiveRef.current || !sessionRef.current) return;
+
       const timeSinceActivity = Date.now() - lastActivityRef.current;
       // Only send keep-alive if we haven't had recent audio activity
-      if (timeSinceActivity > KEEPALIVE_INTERVAL_MS - 5000 && sessionRef.current) {
+      if (timeSinceActivity > KEEPALIVE_INTERVAL_MS - 5000) {
         console.log('Sending keep-alive ping');
         // Send minimal audio blob to keep connection alive
         try {
@@ -228,6 +232,7 @@ const App: React.FC = () => {
         callbacks: {
           onopen: () => {
             console.log("Session Opened" + (isReconnect ? " (reconnected)" : ""));
+            isSessionActiveRef.current = true;
             setStatus(ConnectionStatus.CONNECTED);
             setErrorMsg(null);
             setReconnectAttempt(0); // Reset on successful connection
@@ -246,6 +251,9 @@ const App: React.FC = () => {
             processorRef.current = processor;
 
             processor.onaudioprocess = (e) => {
+              // Skip if session is not active
+              if (!isSessionActiveRef.current) return;
+
               const inputData = e.inputBuffer.getChannelData(0);
 
               // Visualizer volume calculation
@@ -258,7 +266,13 @@ const App: React.FC = () => {
 
               const pcmBlob = createBlob(inputData);
               sessionPromise.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
+                if (isSessionActiveRef.current) {
+                  try {
+                    session.sendRealtimeInput({ media: pcmBlob });
+                  } catch (err) {
+                    console.warn('Failed to send audio:', err);
+                  }
+                }
               });
             };
 
@@ -329,6 +343,7 @@ const App: React.FC = () => {
           },
           onclose: (e: any) => {
             console.log("Session Closed", e);
+            isSessionActiveRef.current = false;
             clearKeepAliveInterval();
 
             // Check if this was an unexpected close (not manual)
@@ -349,6 +364,7 @@ const App: React.FC = () => {
           },
           onerror: (e: any) => {
             console.error("Session Error", e);
+            isSessionActiveRef.current = false;
             clearKeepAliveInterval();
 
             if (!isManualStop) {
@@ -387,6 +403,9 @@ const App: React.FC = () => {
 
   // Internal stop that handles the actual cleanup
   const stopSessionInternal = (finalizeTranscripts: boolean = true) => {
+    // Mark session as inactive immediately to stop audio sending
+    isSessionActiveRef.current = false;
+
     // 1. Finalize any hanging transcripts
     if (finalizeTranscripts) {
       if (currentInputTransRef.current) {
