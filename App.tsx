@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { createBlob, resampleTo16k, blobToBase64 } from './utils/audioUtils';
 import { TranscriptEntry, ConnectionStatus } from './types';
@@ -8,21 +8,33 @@ import {
   StopIcon, 
   ArrowDownTrayIcon, 
   TrashIcon, 
-  SignalIcon,
   DocumentTextIcon,
   ArrowPathIcon,
-  PlayIcon,
   UserGroupIcon,
-  SparklesIcon
+  ClipboardDocumentIcon,
+  ClipboardDocumentCheckIcon,
+  LockClosedIcon,
+  KeyIcon
 } from '@heroicons/react/24/solid';
 
+const CORRECT_PASSWORD = '1234'; // HASŁO DO APLIKACJI
+
 const App: React.FC = () => {
-  // --- State ---
+  // --- Auth State ---
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [passwordInput, setPasswordInput] = useState('');
+  const [loginError, setLoginError] = useState(false);
+
+  // --- App State ---
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [liveTranscript, setLiveTranscript] = useState<TranscriptEntry[]>([]);
+  const [diarizedTranscript, setDiarizedTranscript] = useState<TranscriptEntry[]>([]);
+  const [activeTab, setActiveTab] = useState<'live' | 'diarized'>('live');
+  
   const [volume, setVolume] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  
+  const [isCopied, setIsCopied] = useState(false);
+
   // Recording & Diarization State
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [isProcessingDiarization, setIsProcessingDiarization] = useState(false);
@@ -46,13 +58,16 @@ const App: React.FC = () => {
   const isRecordingActiveRef = useRef<boolean>(false);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // --- Helper: Get Active Transcript ---
+  const currentTranscript = activeTab === 'live' ? liveTranscript : diarizedTranscript;
+
   // --- Effects ---
 
   useEffect(() => {
     if (scrollBottomRef.current) {
       scrollBottomRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [transcript]);
+  }, [liveTranscript, diarizedTranscript, activeTab]);
 
   useEffect(() => {
     return () => {
@@ -62,6 +77,18 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // --- Auth Logic ---
+  const handleLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (passwordInput === CORRECT_PASSWORD) {
+      setIsLoggedIn(true);
+      setLoginError(false);
+    } else {
+      setLoginError(true);
+      setPasswordInput('');
+    }
+  };
+
   // --- Helper Functions ---
 
   const formatTime = () => {
@@ -69,8 +96,8 @@ const App: React.FC = () => {
     return now.toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   };
 
-  const updateTranscript = (text: string, isFinal: boolean) => {
-    setTranscript(prev => {
+  const updateLiveTranscript = (text: string, isFinal: boolean) => {
+    setLiveTranscript(prev => {
       const speaker = 'user'; 
       
       const newEntry: TranscriptEntry = {
@@ -99,22 +126,21 @@ const App: React.FC = () => {
   // --- Core Logic ---
 
   const startSession = async () => {
-    // Prevent multiple clicks
     if (status === ConnectionStatus.CONNECTING || status === ConnectionStatus.CONNECTED) return;
 
     try {
       setErrorMsg(null);
       setStatus(ConnectionStatus.CONNECTING);
       isRecordingActiveRef.current = true;
+      setActiveTab('live'); // Always switch to live when starting
       
-      // Reset audio blob if starting a FRESH session (not a reconnect)
-      // We assume if transcript is empty, it's a fresh start
-      if (transcript.length === 0) {
+      // Reset audio blob if starting a FRESH session
+      if (liveTranscript.length === 0) {
         setAudioBlob(null);
         audioChunksRef.current = [];
       }
 
-      // 1. Initialize Audio Context (Input Only)
+      // 1. Initialize Audio Context
       if (inputAudioContextRef.current) {
         await inputAudioContextRef.current.close();
       }
@@ -132,12 +158,11 @@ const App: React.FC = () => {
         mediaStreamRef.current = stream;
       }
 
-      // --- Start Local Recording (MediaRecorder) ---
-      // Initialize only if not already recording (to handle reconnects gracefully)
+      // --- Start Local Recording ---
       if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
          const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
              ? 'audio/webm;codecs=opus' 
-             : 'audio/mp4'; // Safari fallback
+             : 'audio/mp4'; 
          
          const recorder = new MediaRecorder(stream, { mimeType });
          mediaRecorderRef.current = recorder;
@@ -148,7 +173,7 @@ const App: React.FC = () => {
            }
          };
 
-         recorder.start(1000); // Slice chunks every second
+         recorder.start(1000); 
       }
 
       // 3. Initialize Gemini Client
@@ -210,13 +235,13 @@ const App: React.FC = () => {
               const text = content.inputTranscription.text;
               if (text) {
                  currentInputTransRef.current += text;
-                 updateTranscript(currentInputTransRef.current, false);
+                 updateLiveTranscript(currentInputTransRef.current, false);
               }
             }
 
             if (content?.turnComplete) {
                if (currentInputTransRef.current) {
-                 updateTranscript(currentInputTransRef.current, true);
+                 updateLiveTranscript(currentInputTransRef.current, true);
                  currentInputTransRef.current = '';
                }
             }
@@ -225,7 +250,6 @@ const App: React.FC = () => {
             console.log("Session Closed", e);
             cleanupSession(false); 
 
-            // AUTO-RECONNECT LOGIC
             if (isRecordingActiveRef.current) {
                 console.log("Auto-reconnecting...");
                 setStatus(ConnectionStatus.CONNECTING);
@@ -262,10 +286,9 @@ const App: React.FC = () => {
     }
   };
 
-  // Internal cleanup
   const cleanupSession = (fullStop = true) => {
     if (currentInputTransRef.current) {
-      updateTranscript(currentInputTransRef.current, true);
+      updateLiveTranscript(currentInputTransRef.current, true);
       currentInputTransRef.current = '';
     }
 
@@ -284,10 +307,8 @@ const App: React.FC = () => {
           mediaStreamRef.current.getTracks().forEach(track => track.stop());
           mediaStreamRef.current = null;
         }
-        // Also stop recorder if fully stopping
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
             mediaRecorderRef.current.stop();
-            // The finalizeRecording will be called in onclose or manually
         }
     }
 
@@ -319,7 +340,6 @@ const App: React.FC = () => {
 
   const stopUserAction = () => {
     isRecordingActiveRef.current = false;
-    // Force stop recorder explicitly before cleanup
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
     }
@@ -336,11 +356,7 @@ const App: React.FC = () => {
         const base64Audio = await blobToBase64(audioBlob);
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         
-        // Use standard generative model for file processing (REST API)
-        // 'gemini-2.0-flash' is robust for multimodal tasks like audio processing.
         const modelId = 'gemini-2.0-flash';
-        
-        // Safe mime type extraction
         const mimeType = audioBlob.type.split(';')[0] || 'audio/webm';
 
         const response = await ai.models.generateContent({
@@ -372,21 +388,21 @@ const App: React.FC = () => {
         
         const text = response.text;
         if (text) {
-            // Replace current transcript with the diarized version
-            
             const lines = text.split('\n');
             const newEntries: TranscriptEntry[] = lines
                 .filter(line => line.trim().length > 0)
                 .map((line, idx) => ({
                     id: `diarized-${idx}`,
-                    timestamp: line.match(/\[(.*?)\]/)?.[1] || formatTime(),
-                    speaker: line.toLowerCase().includes('mówca 2') || line.toLowerCase().includes('speaker 2') ? 'model' : 'user', // simple heuristic for visual diff
+                    timestamp: line.match(/\[(.*?)\]/)?.[1] || "00:00",
+                    speaker: line.toLowerCase().includes('mówca 2') || line.toLowerCase().includes('speaker 2') ? 'model' : 'user', 
                     text: line.replace(/\[.*?\]/, '').trim(),
                     isPartial: false
                 }));
             
-            setTranscript(newEntries);
-            alert("Transkrypcja z podziałem na osoby zakończona sukcesem!");
+            // SET SEPARATE DIARIZED TRANSCRIPT
+            setDiarizedTranscript(newEntries);
+            setActiveTab('diarized'); // Switch to the new tab
+            alert("Analiza zakończona. Wynik znajduje się w zakładce 'Analiza Nagrania'.");
         }
 
     } catch (e) {
@@ -398,7 +414,11 @@ const App: React.FC = () => {
   };
 
   const handleDownload = () => {
-    const text = transcript
+    // Download ONLY the active transcript
+    const source = currentTranscript;
+    const prefix = activeTab === 'live' ? 'Live' : 'Analiza';
+
+    const text = source
       .map(t => `[${t.timestamp}] ${t.text}`)
       .join('\n');
     
@@ -406,20 +426,78 @@ const App: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `transkrypcja_${new Date().toISOString().slice(0,10)}.txt`;
+    link.download = `transkrypcja_${prefix}_${new Date().toISOString().slice(0,10)}.txt`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
-  const clearTranscript = () => {
-    if (confirm("Czy na pewno chcesz usunąć całą historię i nagranie?")) {
-      setTranscript([]);
-      setAudioBlob(null);
-      audioChunksRef.current = [];
+  const handleCopy = () => {
+    // Copy ONLY the active transcript
+    const source = currentTranscript;
+    const text = source
+      .map(t => `[${t.timestamp}] ${t.text}`)
+      .join('\n');
+    
+    navigator.clipboard.writeText(text).then(() => {
+        setIsCopied(true);
+        setTimeout(() => setIsCopied(false), 2000);
+    });
+  };
+
+  const clearCurrentTranscript = () => {
+    const tabName = activeTab === 'live' ? 'transkrypcję na żywo' : 'analizę nagrania';
+    if (confirm(`Czy na pewno chcesz usunąć ${tabName}?`)) {
+        if (activeTab === 'live') {
+            setLiveTranscript([]);
+            setAudioBlob(null); // Clear audio too if clearing live source
+            audioChunksRef.current = [];
+        } else {
+            setDiarizedTranscript([]);
+            // Don't clear audioBlob here, user might want to run analysis again
+            setActiveTab('live'); // Go back to live
+        }
     }
   };
 
+  // --- LOGIN SCREEN ---
+  if (!isLoggedIn) {
+    return (
+      <div className="flex flex-col h-screen bg-slate-900 text-slate-100 items-center justify-center font-sans">
+        <div className="w-full max-w-sm p-8 bg-slate-800 rounded-2xl shadow-2xl border border-slate-700">
+          <div className="flex justify-center mb-6">
+            <div className="p-4 bg-slate-900 rounded-full border border-slate-700">
+               <LockClosedIcon className="w-8 h-8 text-blue-500" />
+            </div>
+          </div>
+          <h2 className="text-2xl font-bold text-center mb-6 tracking-tight">Dostęp do LiveScribe</h2>
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div className="relative">
+              <KeyIcon className="w-5 h-5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+              <input 
+                type="password"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                placeholder="Podaj hasło (1234)"
+                className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg py-3 pl-10 pr-4 focus:ring-2 focus:ring-blue-500 focus:outline-none transition-all"
+                autoFocus
+              />
+            </div>
+            {loginError && <p className="text-red-500 text-sm text-center font-medium animate-pulse">Nieprawidłowe hasło</p>}
+            <button 
+              type="submit"
+              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-3 rounded-lg shadow-lg shadow-blue-500/20 transition-all active:scale-95"
+            >
+              Zaloguj
+            </button>
+          </form>
+          <p className="text-center text-slate-600 text-xs mt-6">Wersja prywatna</p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- MAIN APP ---
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans">
       {/* Header */}
@@ -435,23 +513,36 @@ const App: React.FC = () => {
           
           <div className="flex items-center gap-2">
             {status === ConnectionStatus.CONNECTED && (
-              <div className="flex items-center gap-2 mr-4 px-3 py-1 bg-red-500/10 rounded-full border border-red-500/20 transition-all">
+              <div className="hidden md:flex items-center gap-2 mr-4 px-3 py-1 bg-red-500/10 rounded-full border border-red-500/20 transition-all">
                 <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
                 <span className="text-xs font-mono text-red-400 font-semibold tracking-wider">NAGRYWANIE</span>
               </div>
             )}
             
             <button 
+              onClick={handleCopy}
+              disabled={currentTranscript.length === 0}
+              className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors disabled:opacity-30 group relative"
+              title="Kopiuj do schowka"
+            >
+              {isCopied ? (
+                <ClipboardDocumentCheckIcon className="w-5 h-5 text-green-500" />
+              ) : (
+                <ClipboardDocumentIcon className="w-5 h-5" />
+              )}
+            </button>
+
+            <button 
               onClick={handleDownload}
-              disabled={transcript.length === 0}
+              disabled={currentTranscript.length === 0}
               className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors disabled:opacity-30"
               title="Pobierz plik tekstowy"
             >
               <ArrowDownTrayIcon className="w-5 h-5" />
             </button>
             <button 
-              onClick={clearTranscript}
-              disabled={transcript.length === 0}
+              onClick={clearCurrentTranscript}
+              disabled={currentTranscript.length === 0}
               className="p-2 hover:bg-red-900/20 rounded-lg text-slate-400 hover:text-red-400 transition-colors disabled:opacity-30"
               title="Wyczyść"
             >
@@ -461,20 +552,47 @@ const App: React.FC = () => {
         </div>
       </header>
 
+      {/* Tabs */}
+      {diarizedTranscript.length > 0 && (
+         <div className="flex-none bg-slate-900 border-b border-slate-800">
+             <div className="max-w-4xl mx-auto flex gap-4 px-4">
+                 <button 
+                    onClick={() => setActiveTab('live')}
+                    className={`pb-3 pt-3 px-2 text-sm font-medium border-b-2 transition-colors ${activeTab === 'live' ? 'border-blue-500 text-white' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
+                 >
+                    Na Żywo
+                 </button>
+                 <button 
+                    onClick={() => setActiveTab('diarized')}
+                    className={`pb-3 pt-3 px-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'diarized' ? 'border-indigo-500 text-white' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
+                 >
+                    <UserGroupIcon className="w-4 h-4" />
+                    Analiza Nagrania
+                 </button>
+             </div>
+         </div>
+      )}
+
       {/* Main Transcript Area */}
       <main className="flex-1 overflow-y-auto bg-slate-900 p-4 md:p-8 scrollbar-hide relative">
         <div className="max-w-4xl mx-auto pb-32">
-          {transcript.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-64 mt-10 text-slate-600">
-              <div className="p-4 bg-slate-800/50 rounded-full mb-4">
-                 <MicrophoneIcon className="w-12 h-12 opacity-50" />
-              </div>
-              <p className="text-lg font-medium text-slate-400">Gotowy do nagrywania</p>
-              <p className="text-sm mt-2 max-w-md text-center">Naciśnij start. Aplikacja nagra dźwięk lokalnie i będzie tworzyć transkrypcję na żywo. Po zakończeniu będziesz mógł przeanalizować rozmowę z podziałem na osoby.</p>
-            </div>
+          {currentTranscript.length === 0 ? (
+             activeTab === 'live' ? (
+                <div className="flex flex-col items-center justify-center h-64 mt-10 text-slate-600">
+                  <div className="p-4 bg-slate-800/50 rounded-full mb-4">
+                     <MicrophoneIcon className="w-12 h-12 opacity-50" />
+                  </div>
+                  <p className="text-lg font-medium text-slate-400">Gotowy do nagrywania</p>
+                  <p className="text-sm mt-2 max-w-md text-center">Naciśnij start. Aplikacja nagra dźwięk lokalnie i będzie tworzyć transkrypcję na żywo.</p>
+                </div>
+             ) : (
+                <div className="flex flex-col items-center justify-center h-64 mt-10 text-slate-600">
+                    <p>Brak danych analizy.</p>
+                </div>
+             )
           ) : (
             <div className="space-y-1">
-              {transcript.map((entry) => (
+              {currentTranscript.map((entry) => (
                 <TranscriptItem key={entry.id} entry={entry} />
               ))}
             </div>
@@ -550,7 +668,7 @@ const App: React.FC = () => {
            
            {status === ConnectionStatus.CONNECTING && (
               <span className="absolute -top-8 text-xs font-mono text-yellow-400 animate-pulse uppercase tracking-widest">
-                {transcript.length > 0 ? "Odnawianie sesji..." : "Inicjalizacja..."}
+                {liveTranscript.length > 0 ? "Odnawianie sesji..." : "Inicjalizacja..."}
               </span>
            )}
         </div>
