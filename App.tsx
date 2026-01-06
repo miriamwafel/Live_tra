@@ -220,13 +220,12 @@ const App: React.FC = () => {
 
       // 4. Connect to Live API
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        model: 'gemini-2.0-flash-live-001',
         config: {
-          responseModalities: [Modality.AUDIO],
+          responseModalities: [Modality.TEXT],
           inputAudioTranscription: {},
-          outputAudioTranscription: {},
           systemInstruction: {
-            parts: [{ text: "Jesteś inteligentnym asystentem. Rozmawiasz po polsku. Twoim zadaniem jest prowadzenie konwersacji. Jeśli użytkownik przestanie mówić, czekaj cierpliwie." }]
+            parts: [{ text: "Jesteś cichym asystentem do transkrypcji. NIE odpowiadaj na to co mówi użytkownik. Twoje jedyne zadanie to słuchać. Jeśli musisz coś powiedzieć, odpowiedz tylko: OK" }]
           },
         },
         callbacks: {
