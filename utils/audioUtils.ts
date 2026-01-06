@@ -51,3 +51,24 @@ export async function decodeAudioData(
   }
   return buffer;
 }
+
+export function resampleTo16k(audioData: Float32Array, originalSampleRate: number): Float32Array {
+  if (originalSampleRate === 16000) return audioData;
+
+  const targetSampleRate = 16000;
+  const ratio = originalSampleRate / targetSampleRate;
+  const newLength = Math.round(audioData.length / ratio);
+  const result = new Float32Array(newLength);
+
+  for (let i = 0; i < newLength; i++) {
+    const originalIndex = i * ratio;
+    const index1 = Math.floor(originalIndex);
+    const index2 = Math.min(Math.ceil(originalIndex), audioData.length - 1);
+    const weight = originalIndex - index1;
+    
+    // Linear interpolation
+    result[i] = audioData[index1] * (1 - weight) + audioData[index2] * weight;
+  }
+
+  return result;
+}
