@@ -1,6 +1,6 @@
-import { Blob } from '@google/genai';
+import { Blob as GenAIBlob } from '@google/genai';
 
-export function createBlob(data: Float32Array): Blob {
+export function createBlob(data: Float32Array): GenAIBlob {
   const l = data.length;
   const int16 = new Int16Array(l);
   for (let i = 0; i < l; i++) {
