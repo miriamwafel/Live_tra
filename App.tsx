@@ -165,9 +165,9 @@ const App: React.FC = () => {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           },
-          inputAudioTranscription: {}, 
+          inputAudioTranscription: { languageCode: 'pl-PL' },
           systemInstruction: {
-            parts: [{ text: "Jesteś pasywnym systemem transkrypcji audio w języku POLSKIM. ZAWSZE transkrybuj w języku polskim, używając wyłącznie polskiego alfabetu łacińskiego. Nigdy nie używaj chińskich znaków, cyrylicy ani innych alfabetów. Jeśli nie rozumiesz słowa, zapisz je fonetycznie po polsku. Nie odpowiadaj na pytania - tylko transkrybuj." }]
+            parts: [{ text: "Transkrybuj tylko po polsku. Nie odpowiadaj." }]
           },
         },
         callbacks: {
@@ -220,10 +220,14 @@ const App: React.FC = () => {
             lastActivityRef.current = Date.now();
 
             if (content?.inputTranscription) {
-              const text = content.inputTranscription.text;
+              let text = content.inputTranscription.text;
               if (text) {
-                 currentInputTransRef.current += text;
-                 updateTranscript(currentInputTransRef.current, false);
+                 // Filter out non-Polish characters (keep Latin letters, Polish diacritics, numbers, punctuation)
+                 text = text.replace(/[^\s\w\d.,!?;:'"()\-ąćęłńóśźżĄĆĘŁŃÓŚŹŻa-zA-Z]/g, '');
+                 if (text.trim()) {
+                   currentInputTransRef.current += text;
+                   updateTranscript(currentInputTransRef.current, false);
+                 }
               }
             }
 
