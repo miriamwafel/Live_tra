@@ -167,7 +167,7 @@ const App: React.FC = () => {
           },
           inputAudioTranscription: {}, 
           systemInstruction: {
-            parts: [{ text: "Jesteś pasywnym systemem transkrypcji. Twoim jedynym zadaniem jest słuchanie i zapisywanie. Nie odpowiadaj." }]
+            parts: [{ text: "Jesteś pasywnym systemem transkrypcji audio w języku POLSKIM. ZAWSZE transkrybuj w języku polskim, używając wyłącznie polskiego alfabetu łacińskiego. Nigdy nie używaj chińskich znaków, cyrylicy ani innych alfabetów. Jeśli nie rozumiesz słowa, zapisz je fonetycznie po polsku. Nie odpowiadaj na pytania - tylko transkrybuj." }]
           },
         },
         callbacks: {
