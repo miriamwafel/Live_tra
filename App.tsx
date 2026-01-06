@@ -131,6 +131,13 @@ const App: React.FC = () => {
     startSession(); // Auto-start
   };
 
+  const clearRecordingData = () => {
+    setLiveTranscript([]);
+    setDiarizedTranscript([]);
+    setAudioBlob(null);
+    audioChunksRef.current = [];
+  };
+
   const saveSessionToClient = () => {
     if (!selectedClient) return;
     if (liveTranscript.length === 0 && diarizedTranscript.length === 0) {
@@ -139,29 +146,47 @@ const App: React.FC = () => {
     }
 
     const finalTranscript = diarizedTranscript.length > 0 ? diarizedTranscript : liveTranscript;
-    
-    // Create new session
-    const newSession: ClientSession = {
+
+    // Ask user what they want to save
+    const choice = window.prompt(
+      "Co chcesz zrobić?\n\n" +
+      "1 - Zapisz TYLKO do Bazy Wiedzy (bez sesji/nagrania)\n" +
+      "2 - Zapisz pełną sesję (z transkrypcją)\n" +
+      "3 - Anuluj\n\n" +
+      "Wpisz 1, 2 lub 3:"
+    );
+
+    if (choice === '1') {
+      // Only update knowledge base, don't save session
+      generateArtifact(selectedClient, 'knowledge', finalTranscript);
+      clearRecordingData();
+    } else if (choice === '2') {
+      // Save full session
+      const newSession: ClientSession = {
         id: Date.now().toString(),
         date: new Date().toISOString(),
         transcript: finalTranscript,
         summary: `Sesja z dnia ${new Date().toLocaleDateString()}`
-    };
+      };
 
-    const updatedClient = {
+      const updatedClient = {
         ...selectedClient,
         sessions: [newSession, ...selectedClient.sessions]
-    };
+      };
 
-    saveClient(updatedClient);
-    setClients(getClients()); // Refresh list
-    setSelectedClient(updatedClient); // Update active view
-    
-    // Auto-update knowledge base attempt?
-    if (confirm("Sesja zapisana! Czy chcesz, aby AI zaktualizowało Bazę Wiedzy o kliencie na podstawie tej rozmowy?")) {
+      saveClient(updatedClient);
+      setClients(getClients());
+      setSelectedClient(updatedClient);
+
+      if (confirm("Sesja zapisana! Czy chcesz też zaktualizować Bazę Wiedzy?")) {
         generateArtifact(updatedClient, 'knowledge', finalTranscript);
-    } else {
+      } else {
         setView('client-detail');
+      }
+      clearRecordingData();
+    } else {
+      // Cancel - go back
+      setView('client-detail');
     }
   };
 
@@ -174,32 +199,31 @@ const App: React.FC = () => {
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const model = ai.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
         // Prepare Context
         const lastSession = sessionTranscript || (client.sessions.length > 0 ? client.sessions[0].transcript : []);
         const transcriptText = lastSession.map(t => `${t.timestamp} [${t.speaker}]: ${t.text}`).join('\n');
-        
+
         let prompt = "";
-        
+
         if (type === 'email') {
-            prompt = `Jesteś asystentem biznesowym. 
+            prompt = `Jesteś asystentem biznesowym.
             Klient: ${client.name} (${client.industry || 'Brak branży'}).
             Baza wiedzy o kliencie: ${client.knowledgeBase || 'Brak danych'}.
-            
+
             Ostatnia rozmowa (transkrypcja):
             ${transcriptText}
-            
+
             Zadanie: Napisz profesjonalny e-mail podsumowujący (follow-up) do tego klienta.
             Zaproponuj kolejne kroki wynikające z rozmowy. Styl: profesjonalny, ale relacyjny.`;
         } else if (type === 'strategy') {
             prompt = `Jesteś strategiem biznesowym.
             Klient: ${client.name}.
             Kontekst: ${client.knowledgeBase}.
-            
+
             Ostatnia rozmowa:
             ${transcriptText}
-            
+
             Zadanie: Stwórz szkic strategii/oferty dla tego klienta.
             Wypunktuj:
             1. Zrozumiane potrzeby/problemy.
@@ -209,19 +233,22 @@ const App: React.FC = () => {
         } else if (type === 'knowledge') {
             prompt = `Jesteś analitykiem CRM.
             Masz zaktualizować "Bazę Wiedzy" o kliencie na podstawie nowej rozmowy.
-            
+
             Aktualna baza wiedzy: ${client.knowledgeBase}
-            
+
             Nowa rozmowa:
             ${transcriptText}
-            
+
             Zadanie: Wypisz w punktach kluczowe fakty o kliencie (budżet, decydenci, kluczowe bolączki, cele, preferencje).
             Nie pisz streszczenia rozmowy, tylko SUCHE FAKTY do bazy danych. Jeśli coś się zmieniło względem starej bazy, zaktualizuj to.
             Zwróć TYLKO zaktualizowaną treść bazy wiedzy.`;
         }
 
-        const result = await model.generateContent(prompt);
-        const text = result.response.text();
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.0-flash',
+            contents: prompt
+        });
+        const text = response.text;
 
         if (type === 'knowledge') {
             // Auto-save knowledge base
