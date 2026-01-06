@@ -3,13 +3,24 @@ import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { createBlob, decode, decodeAudioData } from './utils/audioUtils';
 import { TranscriptEntry, ConnectionStatus } from './types';
 import TranscriptItem from './components/TranscriptItem';
-import { 
-  MicrophoneIcon, 
-  StopIcon, 
-  ArrowDownTrayIcon, 
-  TrashIcon, 
-  SignalIcon 
+import {
+  MicrophoneIcon,
+  StopIcon,
+  ArrowDownTrayIcon,
+  TrashIcon,
+  SignalIcon
 } from '@heroicons/react/24/solid';
+
+// Reconnection configuration
+const RECONNECT_CONFIG = {
+  maxAttempts: 5,
+  baseDelayMs: 1000,
+  maxDelayMs: 30000,
+  backoffMultiplier: 2,
+};
+
+// Keep-alive interval (send activity every 30 seconds to prevent timeout)
+const KEEPALIVE_INTERVAL_MS = 30000;
 
 const App: React.FC = () => {
   // --- State ---
@@ -17,6 +28,8 @@ const App: React.FC = () => {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [volume, setVolume] = useState(0); // For visualizer
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [isManualStop, setIsManualStop] = useState(false);
 
   // --- Refs for Audio & API ---
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -25,7 +38,7 @@ const App: React.FC = () => {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const sessionRef = useRef<any>(null); // Type 'Session' is internal to genai, using any for now
-  
+
   // Buffers for seamless playback
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
@@ -33,6 +46,12 @@ const App: React.FC = () => {
   // Transcription Buffers
   const currentInputTransRef = useRef<string>('');
   const currentOutputTransRef = useRef<string>('');
+
+  // Reconnection & Keep-alive refs
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const keepAliveIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastActivityRef = useRef<number>(Date.now());
+  const isReconnectingRef = useRef<boolean>(false);
 
   const scrollBottomRef = useRef<HTMLDivElement>(null);
 
@@ -48,10 +67,78 @@ const App: React.FC = () => {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopSession();
+      cleanupAll();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // --- Cleanup & Reconnection Helpers ---
+
+  const clearReconnectTimeout = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+  };
+
+  const clearKeepAliveInterval = () => {
+    if (keepAliveIntervalRef.current) {
+      clearInterval(keepAliveIntervalRef.current);
+      keepAliveIntervalRef.current = null;
+    }
+  };
+
+  const cleanupAll = () => {
+    clearReconnectTimeout();
+    clearKeepAliveInterval();
+    stopSessionInternal(false);
+  };
+
+  const calculateReconnectDelay = (attempt: number): number => {
+    const delay = RECONNECT_CONFIG.baseDelayMs * Math.pow(RECONNECT_CONFIG.backoffMultiplier, attempt);
+    return Math.min(delay, RECONNECT_CONFIG.maxDelayMs);
+  };
+
+  const scheduleReconnect = () => {
+    if (isManualStop || isReconnectingRef.current) return;
+    if (reconnectAttempt >= RECONNECT_CONFIG.maxAttempts) {
+      setErrorMsg(`Nie udało się połączyć po ${RECONNECT_CONFIG.maxAttempts} próbach. Kliknij Start, aby spróbować ponownie.`);
+      setStatus(ConnectionStatus.ERROR);
+      setReconnectAttempt(0);
+      return;
+    }
+
+    isReconnectingRef.current = true;
+    const delay = calculateReconnectDelay(reconnectAttempt);
+    console.log(`Scheduling reconnect attempt ${reconnectAttempt + 1} in ${delay}ms`);
+
+    setErrorMsg(`Połączenie przerwane. Ponowne łączenie za ${Math.ceil(delay / 1000)}s... (próba ${reconnectAttempt + 1}/${RECONNECT_CONFIG.maxAttempts})`);
+
+    reconnectTimeoutRef.current = setTimeout(async () => {
+      setReconnectAttempt(prev => prev + 1);
+      isReconnectingRef.current = false;
+      await startSession(true); // true = isReconnect
+    }, delay);
+  };
+
+  const startKeepAlive = () => {
+    clearKeepAliveInterval();
+    keepAliveIntervalRef.current = setInterval(() => {
+      const timeSinceActivity = Date.now() - lastActivityRef.current;
+      // Only send keep-alive if we haven't had recent audio activity
+      if (timeSinceActivity > KEEPALIVE_INTERVAL_MS - 5000 && sessionRef.current) {
+        console.log('Sending keep-alive ping');
+        // Send minimal audio blob to keep connection alive
+        try {
+          const silentPcm = new Float32Array(160); // 10ms of silence at 16kHz
+          const silentBlob = createBlob(silentPcm);
+          sessionRef.current.sendRealtimeInput({ media: silentBlob });
+        } catch (e) {
+          console.warn('Keep-alive failed:', e);
+        }
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+  };
 
   // --- Helper Functions ---
 
@@ -91,30 +178,48 @@ const App: React.FC = () => {
 
   // --- Core Logic ---
 
-  const startSession = async () => {
+  const startSession = async (isReconnect: boolean = false) => {
     try {
+      if (!isReconnect) {
+        setIsManualStop(false);
+        setReconnectAttempt(0);
+        clearReconnectTimeout();
+      }
       setErrorMsg(null);
       setStatus(ConnectionStatus.CONNECTING);
 
-      // 1. Initialize Audio Contexts
-      // Fix: Access webkitAudioContext via type assertion as it's not standard in Window type
-      inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      // Fix: Access webkitAudioContext via type assertion as it's not standard in Window type
-      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      // 1. Initialize Audio Contexts (only if not already initialized or closed)
+      if (!inputAudioContextRef.current || inputAudioContextRef.current.state === 'closed') {
+        inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      }
+      if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
+        outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      }
 
-      // 2. Get Microphone Access
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
+      // Resume audio contexts if suspended
+      if (inputAudioContextRef.current.state === 'suspended') {
+        await inputAudioContextRef.current.resume();
+      }
+      if (outputAudioContextRef.current.state === 'suspended') {
+        await outputAudioContextRef.current.resume();
+      }
+
+      // 2. Get Microphone Access (reuse existing stream if available)
+      let stream = mediaStreamRef.current;
+      if (!stream || stream.getTracks().every(t => t.readyState === 'ended')) {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStreamRef.current = stream;
+      }
 
       // 3. Initialize Gemini Client
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
+
       // 4. Connect to Live API
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: { model: 'gemini-2.5-flash-native-audio-preview-09-2025' }, 
+          inputAudioTranscription: { model: 'gemini-2.5-flash-native-audio-preview-09-2025' },
           outputAudioTranscription: { model: 'gemini-2.5-flash-native-audio-preview-09-2025' },
           systemInstruction: {
             parts: [{ text: "Jesteś inteligentnym asystentem. Rozmawiasz po polsku. Twoim zadaniem jest prowadzenie konwersacji. Jeśli użytkownik przestanie mówić, czekaj cierpliwie." }]
@@ -122,12 +227,17 @@ const App: React.FC = () => {
         },
         callbacks: {
           onopen: () => {
-            console.log("Session Opened");
+            console.log("Session Opened" + (isReconnect ? " (reconnected)" : ""));
             setStatus(ConnectionStatus.CONNECTED);
-            
+            setErrorMsg(null);
+            setReconnectAttempt(0); // Reset on successful connection
+
+            // Start keep-alive mechanism
+            startKeepAlive();
+
             // Setup Audio Processing Node
             if (!inputAudioContextRef.current) return;
-            
+
             const source = inputAudioContextRef.current.createMediaStreamSource(stream);
             sourceNodeRef.current = source;
 
@@ -137,15 +247,18 @@ const App: React.FC = () => {
 
             processor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              
+
               // Visualizer volume calculation
               let sum = 0;
-              for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
+              for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
               setVolume(Math.sqrt(sum / inputData.length));
+
+              // Update last activity timestamp
+              lastActivityRef.current = Date.now();
 
               const pcmBlob = createBlob(inputData);
               sessionPromise.then((session) => {
-                 session.sendRealtimeInput({ media: pcmBlob });
+                session.sendRealtimeInput({ media: pcmBlob });
               });
             };
 
@@ -153,36 +266,39 @@ const App: React.FC = () => {
             processor.connect(inputAudioContextRef.current.destination);
           },
           onmessage: async (msg: LiveServerMessage) => {
+            // Update activity timestamp on any message
+            lastActivityRef.current = Date.now();
+
             // 1. Handle Transcriptions
             const content = msg.serverContent;
-            
+
             if (content?.inputTranscription) {
               const text = content.inputTranscription.text;
               if (text) {
-                 currentInputTransRef.current += text;
-                 // Live update for user partial
-                 updateTranscript('user', currentInputTransRef.current, false);
+                currentInputTransRef.current += text;
+                // Live update for user partial
+                updateTranscript('user', currentInputTransRef.current, false);
               }
             }
 
             if (content?.outputTranscription) {
-               const text = content.outputTranscription.text;
-               if (text) {
-                 currentOutputTransRef.current += text;
-                 updateTranscript('model', currentOutputTransRef.current, false);
-               }
+              const text = content.outputTranscription.text;
+              if (text) {
+                currentOutputTransRef.current += text;
+                updateTranscript('model', currentOutputTransRef.current, false);
+              }
             }
 
             // Turn Complete Logic (Finalize transcripts)
             if (content?.turnComplete) {
-               if (currentInputTransRef.current) {
-                 updateTranscript('user', currentInputTransRef.current, true);
-                 currentInputTransRef.current = '';
-               }
-               if (currentOutputTransRef.current) {
-                 updateTranscript('model', currentOutputTransRef.current, true);
-                 currentOutputTransRef.current = '';
-               }
+              if (currentInputTransRef.current) {
+                updateTranscript('user', currentInputTransRef.current, true);
+                currentInputTransRef.current = '';
+              }
+              if (currentOutputTransRef.current) {
+                updateTranscript('model', currentOutputTransRef.current, true);
+                currentOutputTransRef.current = '';
+              }
             }
 
             // 2. Handle Audio Output (Playback)
@@ -190,37 +306,65 @@ const App: React.FC = () => {
             if (audioData && outputAudioContextRef.current) {
               const ctx = outputAudioContextRef.current;
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              
+
               const audioBuffer = await decodeAudioData(
                 decode(audioData),
                 ctx,
                 24000,
                 1
               );
-              
+
               const source = ctx.createBufferSource();
               source.buffer = audioBuffer;
               source.connect(ctx.destination);
-              
+
               source.addEventListener('ended', () => {
                 sourcesRef.current.delete(source);
               });
-              
+
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += audioBuffer.duration;
               sourcesRef.current.add(source);
             }
           },
-          onclose: (e) => {
+          onclose: (e: any) => {
             console.log("Session Closed", e);
-            if (status !== ConnectionStatus.DISCONNECTED) {
-               setStatus(ConnectionStatus.DISCONNECTED);
+            clearKeepAliveInterval();
+
+            // Check if this was an unexpected close (not manual)
+            if (!isManualStop && status === ConnectionStatus.CONNECTED) {
+              console.log("Unexpected session close, attempting reconnect...");
+              // Clean up audio nodes but keep the stream
+              if (sourceNodeRef.current) sourceNodeRef.current.disconnect();
+              if (processorRef.current) {
+                processorRef.current.disconnect();
+                processorRef.current = null;
+              }
+              sessionRef.current = null;
+              setStatus(ConnectionStatus.DISCONNECTED);
+              scheduleReconnect();
+            } else {
+              setStatus(ConnectionStatus.DISCONNECTED);
             }
           },
-          onerror: (e) => {
+          onerror: (e: any) => {
             console.error("Session Error", e);
-            setErrorMsg("Błąd połączenia. Spróbuj ponownie.");
-            stopSession();
+            clearKeepAliveInterval();
+
+            if (!isManualStop) {
+              // Clean up and attempt reconnect
+              if (sourceNodeRef.current) sourceNodeRef.current.disconnect();
+              if (processorRef.current) {
+                processorRef.current.disconnect();
+                processorRef.current = null;
+              }
+              sessionRef.current = null;
+              setStatus(ConnectionStatus.DISCONNECTED);
+              scheduleReconnect();
+            } else {
+              setErrorMsg("Błąd połączenia.");
+              stopSessionInternal(false);
+            }
           }
         }
       });
@@ -230,47 +374,59 @@ const App: React.FC = () => {
 
     } catch (err) {
       console.error(err);
-      setErrorMsg("Nie udało się uzyskać dostępu do mikrofonu lub API.");
-      setStatus(ConnectionStatus.ERROR);
+
+      if (!isManualStop && isReconnect) {
+        // If this was a reconnect attempt that failed, schedule another
+        scheduleReconnect();
+      } else {
+        setErrorMsg("Nie udało się uzyskać dostępu do mikrofonu lub API.");
+        setStatus(ConnectionStatus.ERROR);
+      }
     }
   };
 
-  const stopSession = () => {
+  // Internal stop that handles the actual cleanup
+  const stopSessionInternal = (finalizeTranscripts: boolean = true) => {
     // 1. Finalize any hanging transcripts
-    if (currentInputTransRef.current) {
-      updateTranscript('user', currentInputTransRef.current, true);
-      currentInputTransRef.current = '';
-    }
-    if (currentOutputTransRef.current) {
-      updateTranscript('model', currentOutputTransRef.current, true);
-      currentOutputTransRef.current = '';
+    if (finalizeTranscripts) {
+      if (currentInputTransRef.current) {
+        updateTranscript('user', currentInputTransRef.current, true);
+        currentInputTransRef.current = '';
+      }
+      if (currentOutputTransRef.current) {
+        updateTranscript('model', currentOutputTransRef.current, true);
+        currentOutputTransRef.current = '';
+      }
     }
 
-    // 2. Stop Tracks
+    // 2. Clear keep-alive
+    clearKeepAliveInterval();
+
+    // 3. Stop Tracks
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;
     }
 
-    // 3. Disconnect Audio Nodes
+    // 4. Disconnect Audio Nodes
     if (sourceNodeRef.current) sourceNodeRef.current.disconnect();
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current = null;
     }
 
-    // 4. Close Audio Contexts
-    if (inputAudioContextRef.current) inputAudioContextRef.current.close();
-    if (outputAudioContextRef.current) outputAudioContextRef.current.close();
+    // 5. Close Audio Contexts
+    if (inputAudioContextRef.current && inputAudioContextRef.current.state !== 'closed') {
+      inputAudioContextRef.current.close();
+    }
+    if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
+      outputAudioContextRef.current.close();
+    }
 
-    // 5. Close API Session
+    // 6. Close API Session
     if (sessionRef.current) {
-      // The SDK doesn't always expose a clean .close() on the interface returned by promise in all versions, 
-      // but assuming standard websocket closure or letting GC handle it if no method.
-      // However, usually we can send a client command or just drop the connection.
-      // Based on docs: "Use session.close() to close the connection"
       try {
-         sessionRef.current.close();
+        sessionRef.current.close();
       } catch (e) {
         console.warn("Could not explicitly close session", e);
       }
@@ -279,6 +435,15 @@ const App: React.FC = () => {
 
     setStatus(ConnectionStatus.DISCONNECTED);
     setVolume(0);
+  };
+
+  // Public stop - called when user clicks Stop button
+  const stopSession = () => {
+    setIsManualStop(true);
+    clearReconnectTimeout();
+    setReconnectAttempt(0);
+    setErrorMsg(null);
+    stopSessionInternal(true);
   };
 
   const handleDownload = () => {
@@ -310,7 +475,15 @@ const App: React.FC = () => {
       <header className="flex-none p-4 bg-slate-800 border-b border-slate-700 shadow-md z-10">
         <div className="max-w-4xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-3">
-             <div className={`w-3 h-3 rounded-full ${status === ConnectionStatus.CONNECTED ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+             <div className={`w-3 h-3 rounded-full ${
+               status === ConnectionStatus.CONNECTED
+                 ? 'bg-green-500 animate-pulse'
+                 : reconnectAttempt > 0
+                   ? 'bg-yellow-500 animate-pulse'
+                   : status === ConnectionStatus.CONNECTING
+                     ? 'bg-blue-500 animate-pulse'
+                     : 'bg-red-500'
+             }`}></div>
              <h1 className="text-xl font-semibold tracking-tight text-white">LiveScribe <span className="text-blue-400">PL</span></h1>
           </div>
           
@@ -319,6 +492,14 @@ const App: React.FC = () => {
               <div className="flex items-center gap-2 mr-4 px-3 py-1 bg-slate-700 rounded-full border border-slate-600">
                 <SignalIcon className="w-4 h-4 text-green-400" />
                 <span className="text-xs font-mono text-green-400">NA ŻYWO</span>
+              </div>
+            )}
+            {reconnectAttempt > 0 && status !== ConnectionStatus.CONNECTED && (
+              <div className="flex items-center gap-2 mr-4 px-3 py-1 bg-yellow-900/50 rounded-full border border-yellow-600">
+                <div className="w-2 h-2 bg-yellow-400 rounded-full animate-pulse" />
+                <span className="text-xs font-mono text-yellow-400">
+                  ŁĄCZENIE ({reconnectAttempt}/{RECONNECT_CONFIG.maxAttempts})
+                </span>
               </div>
             )}
             
@@ -379,13 +560,21 @@ const App: React.FC = () => {
              />
            )}
 
-           {status === ConnectionStatus.DISCONNECTED || status === ConnectionStatus.ERROR ? (
+           {(status === ConnectionStatus.DISCONNECTED || status === ConnectionStatus.ERROR) && reconnectAttempt === 0 ? (
              <button
-               onClick={startSession}
+               onClick={() => startSession(false)}
                className="group relative flex items-center justify-center w-16 h-16 bg-blue-600 hover:bg-blue-500 text-white rounded-full shadow-lg hover:shadow-blue-500/30 transition-all transform hover:scale-105"
              >
                <MicrophoneIcon className="w-8 h-8" />
                <span className="absolute -bottom-8 text-xs font-medium text-slate-400 group-hover:text-white transition-colors">Start</span>
+             </button>
+           ) : reconnectAttempt > 0 && status !== ConnectionStatus.CONNECTED ? (
+             <button
+               onClick={stopSession}
+               className="group relative flex items-center justify-center w-16 h-16 bg-yellow-600 hover:bg-yellow-500 text-white rounded-full shadow-lg hover:shadow-yellow-500/30 transition-all transform hover:scale-105"
+             >
+               <StopIcon className="w-8 h-8" />
+               <span className="absolute -bottom-8 text-xs font-medium text-slate-400 group-hover:text-white transition-colors">Anuluj</span>
              </button>
            ) : (
              <button
@@ -396,9 +585,14 @@ const App: React.FC = () => {
                <span className="absolute -bottom-8 text-xs font-medium text-slate-400 group-hover:text-white transition-colors">Stop</span>
              </button>
            )}
-           
-           {status === ConnectionStatus.CONNECTING && (
+
+           {status === ConnectionStatus.CONNECTING && reconnectAttempt === 0 && (
               <span className="absolute top-[-30px] text-xs text-blue-400 animate-pulse">Łączenie...</span>
+           )}
+           {reconnectAttempt > 0 && status !== ConnectionStatus.CONNECTED && (
+              <span className="absolute top-[-30px] text-xs text-yellow-400 animate-pulse">
+                Ponowne łączenie...
+              </span>
            )}
         </div>
       </footer>
