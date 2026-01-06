@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { createBlob, resampleTo16k } from './utils/audioUtils';
+import { createBlob, resampleTo16k, blobToBase64 } from './utils/audioUtils';
 import { TranscriptEntry, ConnectionStatus } from './types';
 import TranscriptItem from './components/TranscriptItem';
 import { 
@@ -10,7 +10,10 @@ import {
   TrashIcon, 
   SignalIcon,
   DocumentTextIcon,
-  ArrowPathIcon
+  ArrowPathIcon,
+  PlayIcon,
+  UserGroupIcon,
+  SparklesIcon
 } from '@heroicons/react/24/solid';
 
 const App: React.FC = () => {
@@ -19,6 +22,10 @@ const App: React.FC = () => {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [volume, setVolume] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  
+  // Recording & Diarization State
+  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [isProcessingDiarization, setIsProcessingDiarization] = useState(false);
 
   // --- Refs for Audio & API ---
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -26,6 +33,10 @@ const App: React.FC = () => {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const sessionRef = useRef<any>(null);
+  
+  // Recorder Refs
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
   
   // Logic Refs
   const currentInputTransRef = useRef<string>('');
@@ -95,15 +106,21 @@ const App: React.FC = () => {
       setErrorMsg(null);
       setStatus(ConnectionStatus.CONNECTING);
       isRecordingActiveRef.current = true;
+      
+      // Reset audio blob if starting a FRESH session (not a reconnect)
+      // We assume if transcript is empty, it's a fresh start
+      if (transcript.length === 0) {
+        setAudioBlob(null);
+        audioChunksRef.current = [];
+      }
 
       // 1. Initialize Audio Context (Input Only)
-      // Ensure previous context is closed
       if (inputAudioContextRef.current) {
         await inputAudioContextRef.current.close();
       }
       inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
 
-      // 2. Get Microphone Access (Reuse stream if available to avoid prompting user again during reconnect)
+      // 2. Get Microphone Access
       let stream = mediaStreamRef.current;
       if (!stream || !stream.active) {
          stream = await navigator.mediaDevices.getUserMedia({ audio: {
@@ -113,6 +130,25 @@ const App: React.FC = () => {
           noiseSuppression: true
         } });
         mediaStreamRef.current = stream;
+      }
+
+      // --- Start Local Recording (MediaRecorder) ---
+      // Initialize only if not already recording (to handle reconnects gracefully)
+      if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
+         const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+             ? 'audio/webm;codecs=opus' 
+             : 'audio/mp4'; // Safari fallback
+         
+         const recorder = new MediaRecorder(stream, { mimeType });
+         mediaRecorderRef.current = recorder;
+         
+         recorder.ondataavailable = (event) => {
+           if (event.data.size > 0) {
+             audioChunksRef.current.push(event.data);
+           }
+         };
+
+         recorder.start(1000); // Slice chunks every second
       }
 
       // 3. Initialize Gemini Client
@@ -128,7 +164,7 @@ const App: React.FC = () => {
           },
           inputAudioTranscription: {}, 
           systemInstruction: {
-            parts: [{ text: "Jesteś pasywnym systemem transkrypcji. Twoim jedynym zadaniem jest słuchanie i zapisywanie. Nie odpowiadaj." }]
+            parts: [{ text: "Jesteś profesjonalnym transkrybentem języka polskiego. Twoim absolutnym priorytetem jest zapisywanie słyszanej mowy WYŁĄCZNIE w języku polskim. \n\nZASADY:\n1. Zapisuj tekst poprawną polszczyzną, dbając o interpunkcję.\n2. NIGDY nie używaj cyrylicy. Jeśli słowo brzmi obco, zapisz je fonetycznie alfabetem łacińskim.\n3. Jeśli mowa jest niewyraźna, staraj się dopasować najbardziej prawdopodobne słowa polskie.\n4. Nie prowadź konwersacji. Nie odpowiadaj na pytania. Działaj jak 'ukryty stenograf'." }]
           },
         },
         callbacks: {
@@ -187,25 +223,23 @@ const App: React.FC = () => {
           },
           onclose: (e) => {
             console.log("Session Closed", e);
-            cleanupSession(false); // Clean up audio nodes but keep intent
+            cleanupSession(false); 
 
             // AUTO-RECONNECT LOGIC
-            // If user didn't press stop (isRecordingActiveRef is true), reconnect.
             if (isRecordingActiveRef.current) {
-                console.log("Auto-reconnecting due to API limit or network drop...");
-                setStatus(ConnectionStatus.CONNECTING); // Visual feedback
+                console.log("Auto-reconnecting...");
+                setStatus(ConnectionStatus.CONNECTING);
                 
-                // Small delay to ensure clean socket state
                 reconnectTimeoutRef.current = setTimeout(() => {
                     startSession();
                 }, 500);
             } else {
                 setStatus(ConnectionStatus.DISCONNECTED);
+                finalizeRecording();
             }
           },
           onerror: (e) => {
             console.error("Session Error", e);
-            // Don't kill the app, try to reconnect if it's a network blip
             if (isRecordingActiveRef.current) {
                  cleanupSession(false);
                  reconnectTimeoutRef.current = setTimeout(() => {
@@ -228,7 +262,7 @@ const App: React.FC = () => {
     }
   };
 
-  // Internal cleanup (stops nodes, leaves intent flag alone unless specified)
+  // Internal cleanup
   const cleanupSession = (fullStop = true) => {
     if (currentInputTransRef.current) {
       updateTranscript(currentInputTransRef.current, true);
@@ -245,9 +279,16 @@ const App: React.FC = () => {
       processorRef.current = null;
     }
 
-    if (fullStop && mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
-      mediaStreamRef.current = null;
+    if (fullStop) {
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach(track => track.stop());
+          mediaStreamRef.current = null;
+        }
+        // Also stop recorder if fully stopping
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            mediaRecorderRef.current.stop();
+            // The finalizeRecording will be called in onclose or manually
+        }
     }
 
     if (inputAudioContextRef.current) {
@@ -268,11 +309,92 @@ const App: React.FC = () => {
     setVolume(0);
   };
 
-  // User explicitly clicks Stop
+  const finalizeRecording = () => {
+    if (audioChunksRef.current.length > 0) {
+        const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        setAudioBlob(blob);
+    }
+  };
+
   const stopUserAction = () => {
     isRecordingActiveRef.current = false;
+    // Force stop recorder explicitly before cleanup
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+    }
     cleanupSession(true);
     setStatus(ConnectionStatus.DISCONNECTED);
+    finalizeRecording();
+  };
+
+  const handleDiarization = async () => {
+    if (!audioBlob) return;
+    
+    setIsProcessingDiarization(true);
+    try {
+        const base64Audio = await blobToBase64(audioBlob);
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        
+        // Use standard generative model for file processing (REST API)
+        // 'gemini-2.0-flash' is robust for multimodal tasks like audio processing.
+        const modelId = 'gemini-2.0-flash';
+        
+        // Safe mime type extraction
+        const mimeType = audioBlob.type.split(';')[0] || 'audio/webm';
+
+        const response = await ai.models.generateContent({
+            model: modelId,
+            contents: {
+                parts: [
+                    {
+                        inlineData: {
+                            mimeType: mimeType,
+                            data: base64Audio
+                        }
+                    },
+                    {
+                        text: `Przeanalizuj to nagranie audio i stwórz dokładną transkrypcję w języku polskim. 
+                        
+                        Twoim kluczowym zadaniem jest ROZPOZNANIE MÓWCÓW (Diarizacja).
+                        
+                        Formatuj wyjście następująco:
+                        [00:00] Mówca 1: Tekst...
+                        [00:15] Mówca 2: Tekst...
+                        
+                        Jeśli rozpoznasz imiona z kontekstu, użyj ich zamiast "Mówca 1". 
+                        Zadbaj o interpunkcję i poprawność gramatyczną.
+                        NIGDY nie używaj cyrylicy, używaj tylko języka polskiego (alfabet łaciński).`
+                    }
+                ]
+            }
+        });
+        
+        const text = response.text;
+        if (text) {
+            // Replace current transcript with the diarized version
+            
+            const lines = text.split('\n');
+            const newEntries: TranscriptEntry[] = lines
+                .filter(line => line.trim().length > 0)
+                .map((line, idx) => ({
+                    id: `diarized-${idx}`,
+                    timestamp: line.match(/\[(.*?)\]/)?.[1] || formatTime(),
+                    speaker: line.toLowerCase().includes('mówca 2') || line.toLowerCase().includes('speaker 2') ? 'model' : 'user', // simple heuristic for visual diff
+                    text: line.replace(/\[.*?\]/, '').trim(),
+                    isPartial: false
+                }));
+            
+            setTranscript(newEntries);
+            alert("Transkrypcja z podziałem na osoby zakończona sukcesem!");
+        }
+
+    } catch (e) {
+        console.error("Diarization error", e);
+        setErrorMsg("Błąd podczas analizy nagrania. Sprawdź konsolę (F12) jeśli błąd się powtarza.");
+    } finally {
+        setIsProcessingDiarization(false);
+    }
   };
 
   const handleDownload = () => {
@@ -291,8 +413,10 @@ const App: React.FC = () => {
   };
 
   const clearTranscript = () => {
-    if (confirm("Czy na pewno chcesz usunąć całą historię?")) {
+    if (confirm("Czy na pewno chcesz usunąć całą historię i nagranie?")) {
       setTranscript([]);
+      setAudioBlob(null);
+      audioChunksRef.current = [];
     }
   };
 
@@ -305,7 +429,7 @@ const App: React.FC = () => {
              <DocumentTextIcon className="w-6 h-6 text-blue-500" />
              <div className="flex flex-col">
                 <h1 className="text-xl font-bold tracking-tight text-white leading-none">LiveScribe <span className="text-slate-500 font-normal">Transkrypcja</span></h1>
-                <span className="text-[10px] text-slate-600 font-mono mt-0.5">Model: Gemini 2.5 Flash</span>
+                <span className="text-[10px] text-slate-600 font-mono mt-0.5">Model: Gemini 2.5 Flash (PL)</span>
              </div>
           </div>
           
@@ -314,12 +438,6 @@ const App: React.FC = () => {
               <div className="flex items-center gap-2 mr-4 px-3 py-1 bg-red-500/10 rounded-full border border-red-500/20 transition-all">
                 <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
                 <span className="text-xs font-mono text-red-400 font-semibold tracking-wider">NAGRYWANIE</span>
-              </div>
-            )}
-            {status === ConnectionStatus.CONNECTING && (
-              <div className="flex items-center gap-2 mr-4 px-3 py-1 bg-yellow-500/10 rounded-full border border-yellow-500/20 transition-all">
-                <ArrowPathIcon className="w-3 h-3 text-yellow-500 animate-spin" />
-                <span className="text-xs font-mono text-yellow-400 font-semibold tracking-wider">WCHODZENIE</span>
               </div>
             )}
             
@@ -352,7 +470,7 @@ const App: React.FC = () => {
                  <MicrophoneIcon className="w-12 h-12 opacity-50" />
               </div>
               <p className="text-lg font-medium text-slate-400">Gotowy do nagrywania</p>
-              <p className="text-sm mt-2 max-w-md text-center">Naciśnij start. Aplikacja automatycznie wznowi połączenie, jeśli zostanie przerwane przez limit czasowy.</p>
+              <p className="text-sm mt-2 max-w-md text-center">Naciśnij start. Aplikacja nagra dźwięk lokalnie i będzie tworzyć transkrypcję na żywo. Po zakończeniu będziesz mógł przeanalizować rozmowę z podziałem na osoby.</p>
             </div>
           ) : (
             <div className="space-y-1">
@@ -364,6 +482,36 @@ const App: React.FC = () => {
           <div ref={scrollBottomRef} />
         </div>
       </main>
+
+      {/* Audio Processing Toolbar (Post-recording) */}
+      {status === ConnectionStatus.DISCONNECTED && audioBlob && (
+        <div className="absolute bottom-32 left-0 right-0 z-30 flex justify-center animate-fade-in-up">
+           <div className="bg-slate-800/90 backdrop-blur border border-slate-700 p-4 rounded-xl shadow-2xl flex items-center gap-4 max-w-2xl mx-4">
+              <div className="flex flex-col">
+                  <span className="text-xs text-slate-400 font-mono uppercase mb-1">Ostatnie nagranie</span>
+                  <audio controls src={URL.createObjectURL(audioBlob)} className="h-8 w-64" />
+              </div>
+              <div className="h-10 w-px bg-slate-700 mx-2"></div>
+              <button 
+                onClick={handleDiarization}
+                disabled={isProcessingDiarization}
+                className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 text-white px-4 py-2 rounded-lg font-medium transition-colors shadow-lg shadow-indigo-500/20"
+              >
+                {isProcessingDiarization ? (
+                   <>
+                     <ArrowPathIcon className="w-5 h-5 animate-spin" />
+                     Analizowanie...
+                   </>
+                ) : (
+                   <>
+                     <UserGroupIcon className="w-5 h-5" />
+                     Transkrybuj z podziałem na osoby
+                   </>
+                )}
+              </button>
+           </div>
+        </div>
+      )}
 
       {/* Error Toast */}
       {errorMsg && (
