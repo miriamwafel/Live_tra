@@ -45,6 +45,8 @@ const App: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedContent, setGeneratedContent] = useState<string | null>(null);
   const [generationType, setGenerationType] = useState<'email' | 'strategy' | 'knowledge'>('email');
+  const [descriptionPreview, setDescriptionPreview] = useState<string | null>(null);
+  const [pendingTranscript, setPendingTranscript] = useState<TranscriptEntry[] | null>(null);
 
   // --- Session/Recording State ---
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
@@ -131,7 +133,14 @@ const App: React.FC = () => {
     startSession(); // Auto-start
   };
 
-  const saveSessionToClient = () => {
+  const clearRecordingData = () => {
+    setLiveTranscript([]);
+    setDiarizedTranscript([]);
+    setAudioBlob(null);
+    audioChunksRef.current = [];
+  };
+
+  const saveSessionToClient = async () => {
     if (!selectedClient) return;
     if (liveTranscript.length === 0 && diarizedTranscript.length === 0) {
         setView('client-detail');
@@ -139,30 +148,75 @@ const App: React.FC = () => {
     }
 
     const finalTranscript = diarizedTranscript.length > 0 ? diarizedTranscript : liveTranscript;
-    
-    // Create new session
-    const newSession: ClientSession = {
-        id: Date.now().toString(),
-        date: new Date().toISOString(),
-        transcript: finalTranscript,
-        summary: `Sesja z dnia ${new Date().toLocaleDateString()}`
-    };
+    setPendingTranscript(finalTranscript);
 
-    const updatedClient = {
-        ...selectedClient,
-        sessions: [newSession, ...selectedClient.sessions]
-    };
+    // Generate preview
+    await generateDescriptionPreview(selectedClient, finalTranscript);
+  };
 
-    saveClient(updatedClient);
-    setClients(getClients()); // Refresh list
-    setSelectedClient(updatedClient); // Update active view
-    
-    // Auto-update knowledge base attempt?
-    if (confirm("Sesja zapisana! Czy chcesz, aby AI zaktualizowało Bazę Wiedzy o kliencie na podstawie tej rozmowy?")) {
-        generateArtifact(updatedClient, 'knowledge', finalTranscript);
-    } else {
-        setView('client-detail');
+  const generateDescriptionPreview = async (client: ClientProfile, transcript: TranscriptEntry[]) => {
+    setIsGenerating(true);
+    setDescriptionPreview(null);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const transcriptText = transcript.map(t => `[${t.timestamp}] ${t.text}`).join('\n');
+      const wordCount = transcriptText.split(/\s+/).length;
+
+      const prompt = `Jesteś protokolantem spotkania. Twoim zadaniem jest napisać szczegółową relację z rozmowy.
+
+Klient: ${client.name} (${client.industry || 'Brak branży'})
+
+${client.knowledgeBase ? `Wcześniejsze informacje o kliencie:\n${client.knowledgeBase}\n\n` : ''}=== ROZMOWA ===
+${transcriptText}
+=== KONIEC ===
+
+NAPISZ szczegółową relację z tej rozmowy:
+- Opisz CO kto powiedział, jakie padły słowa
+- Opisz przebieg rozmowy chronologicznie
+- Uwzględnij WSZYSTKIE szczegóły - tematy, liczby, nazwy, daty
+- Pisz prostym językiem, bez interpretacji i wniosków AI
+- NIE pisz rzeczy typu "wnioskując z...", "klient wydaje się...", "można założyć że..."
+- Pisz TYLKO fakty - co zostało powiedziane, bez domysłów
+- Minimum ${wordCount} słów
+
+Pisz w stylu: "Rozmowa dotyczyła... Klient powiedział że... Omówiono temat... Padła informacja że..."`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: prompt
+      });
+
+      setDescriptionPreview(response.text || '');
+    } catch (e) {
+      console.error(e);
+      alert("Błąd generowania opisu.");
+      setDescriptionPreview(null);
+    } finally {
+      setIsGenerating(false);
     }
+  };
+
+  const acceptDescription = () => {
+    if (!selectedClient || !descriptionPreview) return;
+
+    const updatedClient = { ...selectedClient, knowledgeBase: descriptionPreview };
+    saveClient(updatedClient);
+    setClients(getClients());
+    setSelectedClient(updatedClient);
+
+    // Clear everything
+    setDescriptionPreview(null);
+    setPendingTranscript(null);
+    clearRecordingData();
+    setView('client-detail');
+  };
+
+  const rejectDescription = () => {
+    setDescriptionPreview(null);
+    setPendingTranscript(null);
+    clearRecordingData();
+    setView('client-detail');
   };
 
   // --- AI Generator Logic ---
@@ -174,32 +228,31 @@ const App: React.FC = () => {
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const model = ai.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
         // Prepare Context
         const lastSession = sessionTranscript || (client.sessions.length > 0 ? client.sessions[0].transcript : []);
         const transcriptText = lastSession.map(t => `${t.timestamp} [${t.speaker}]: ${t.text}`).join('\n');
-        
+
         let prompt = "";
-        
+
         if (type === 'email') {
-            prompt = `Jesteś asystentem biznesowym. 
+            prompt = `Jesteś asystentem biznesowym.
             Klient: ${client.name} (${client.industry || 'Brak branży'}).
             Baza wiedzy o kliencie: ${client.knowledgeBase || 'Brak danych'}.
-            
+
             Ostatnia rozmowa (transkrypcja):
             ${transcriptText}
-            
+
             Zadanie: Napisz profesjonalny e-mail podsumowujący (follow-up) do tego klienta.
             Zaproponuj kolejne kroki wynikające z rozmowy. Styl: profesjonalny, ale relacyjny.`;
         } else if (type === 'strategy') {
             prompt = `Jesteś strategiem biznesowym.
             Klient: ${client.name}.
             Kontekst: ${client.knowledgeBase}.
-            
+
             Ostatnia rozmowa:
             ${transcriptText}
-            
+
             Zadanie: Stwórz szkic strategii/oferty dla tego klienta.
             Wypunktuj:
             1. Zrozumiane potrzeby/problemy.
@@ -207,21 +260,41 @@ const App: React.FC = () => {
             3. Kluczowe korzyści.
             4. Wstępny plan działania.`;
         } else if (type === 'knowledge') {
-            prompt = `Jesteś analitykiem CRM.
-            Masz zaktualizować "Bazę Wiedzy" o kliencie na podstawie nowej rozmowy.
-            
-            Aktualna baza wiedzy: ${client.knowledgeBase}
-            
-            Nowa rozmowa:
+            const wordCount = transcriptText.split(/\s+/).length;
+            prompt = `Jesteś ekspertem od dokumentowania spotkań biznesowych.
+
+            Klient: ${client.name} (${client.industry || 'Brak branży'})
+
+            Aktualna baza wiedzy o kliencie: ${client.knowledgeBase || 'Brak wcześniejszych danych'}
+
+            === ROZMOWA DO PRZEANALIZOWANIA ===
             ${transcriptText}
-            
-            Zadanie: Wypisz w punktach kluczowe fakty o kliencie (budżet, decydenci, kluczowe bolączki, cele, preferencje).
-            Nie pisz streszczenia rozmowy, tylko SUCHE FAKTY do bazy danych. Jeśli coś się zmieniło względem starej bazy, zaktualizuj to.
-            Zwróć TYLKO zaktualizowaną treść bazy wiedzy.`;
+            === KONIEC ROZMOWY ===
+
+            ZADANIE: Napisz EKSTREMALNIE SZCZEGÓŁOWY opis tej rozmowy.
+
+            WYMAGANIA:
+            - Opis musi mieć MINIMUM ${wordCount} słów (tyle ile transkrypcja lub więcej)
+            - Opisz KAŻDY poruszony temat bardzo dokładnie
+            - Uwzględnij WSZYSTKIE szczegóły, niuanse, kontekst
+            - Opisz ton rozmowy, nastrój, dynamikę
+            - Wynotuj WSZYSTKIE konkretne informacje (liczby, daty, nazwiska, firmy, produkty)
+            - Opisz co klient powiedział, jak zareagował, jakie miał obawy
+            - Uwzględnij wszelkie ustalenia, obietnice, kolejne kroki
+            - Jeśli była wcześniejsza baza wiedzy - zintegruj nowe informacje ze starymi
+            - NIE pomijaj żadnych detali - im więcej szczegółów tym lepiej
+            - Pisz w trzeciej osobie, profesjonalnie ale szczegółowo
+
+            FORMAT: Ciągły tekst opisowy (nie punkty). Możesz użyć akapitów dla czytelności.
+
+            Zwróć TYLKO szczegółowy opis do bazy wiedzy (bez komentarzy, bez nagłówków typu "Opis rozmowy:").`;
         }
 
-        const result = await model.generateContent(prompt);
-        const text = result.response.text();
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.0-flash',
+            contents: prompt
+        });
+        const text = response.text;
 
         if (type === 'knowledge') {
             // Auto-save knowledge base
@@ -622,6 +695,44 @@ const App: React.FC = () => {
 
   // 4. RECORDING VIEW (Reusing logic but wrapped)
   if (view === 'recording' && selectedClient) {
+      // Show description preview modal
+      if (descriptionPreview || isGenerating) {
+        return (
+          <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans">
+            <header className="flex-none p-4 bg-slate-900 border-b border-slate-800">
+              <h1 className="text-lg font-bold">Podgląd opisu rozmowy</h1>
+              <span className="text-xs text-slate-400">Sprawdź i zaakceptuj lub odrzuć</span>
+            </header>
+            <main className="flex-1 overflow-y-auto p-6">
+              <div className="max-w-3xl mx-auto">
+                {isGenerating ? (
+                  <div className="flex flex-col items-center justify-center py-20">
+                    <ArrowPathIcon className="w-12 h-12 text-blue-500 animate-spin mb-4" />
+                    <p className="text-slate-400">Generowanie opisu...</p>
+                  </div>
+                ) : (
+                  <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-6">
+                    <p className="text-slate-200 whitespace-pre-wrap leading-relaxed">{descriptionPreview}</p>
+                  </div>
+                )}
+              </div>
+            </main>
+            {!isGenerating && descriptionPreview && (
+              <footer className="flex-none p-4 bg-slate-900 border-t border-slate-800">
+                <div className="max-w-3xl mx-auto flex justify-end gap-3">
+                  <button onClick={rejectDescription} className="px-6 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-medium">
+                    Odrzuć
+                  </button>
+                  <button onClick={acceptDescription} className="px-6 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg font-medium">
+                    Akceptuj i zapisz
+                  </button>
+                </div>
+              </footer>
+            )}
+          </div>
+        );
+      }
+
       return (
         <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans relative">
             <header className="flex-none p-4 bg-slate-900 border-b border-slate-800 z-10 flex justify-between">
